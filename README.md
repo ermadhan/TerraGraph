@@ -8,8 +8,9 @@ An interactive 3D scientific geospatial explorer combining **NASA SRTM 30m** and
 - **Overture Maps Vector Streaming**: Streams official Overture Maps PMTiles (`buildings`, `transportation`, `base`) directly from AWS S3 with an interactive **Attribute & Provenance Inspector** for clicking 3D buildings, road segments, and infrastructure.
 - **SRTM 30m vs. ASTER 30m Analysis**:
   - **Cross-Section Profiler**: Draw multi-point transects across terrain to plot dual-curve `SRTM 30m` vs. `ASTER 30m` elevation profiles, synchronized 3D cursor scrubbing, RMSE/mean bias stats, and CSV export.
+  - **3D Geodesic & Terrain Distance**: Click two points (`A` & `B`) to compute the WGS84 ellipsoidal geodesic distance, initial bearing, SRTM 30m & ASTER 30m terrain-integrated 3D surface distances (`+relief %`), endpoint elevations, ascent/descent, and max grade.
   - **Viewport Discrepancy Grid**: Compute a `9×9` `ASTER − SRTM` elevation residual grid rendered as a diverging Coolwarm heatmap overlay with a 7-bin residual histogram.
-- **Spatial Orientation Instruments**: Includes a floating **3D Orientation Compass** (visually tilting and rotating with live camera pitch and bearing) and a togglable **1° Geographic Graticule** with projected edge coordinate tick labels.
+- **3D Navigation & Spatial Orientation Instruments**: Includes full 3D orbit/rotation controls (**Pan/Orbit** left-drag mode toggle, `Shift`/`Alt`+drag, right-click drag, `±45°` rotate buttons), a draggable **3D Orientation Compass** (tilting and rotating with live camera pitch and bearing), and a togglable **1° Geographic Graticule** with projected edge coordinate tick labels.
 
 ---
 
@@ -128,5 +129,6 @@ http://localhost:3000
 | `GET /api/overture/config` | Resolves latest Overture Maps PMTiles release from STAC |
 | `GET /api/tiles/terrarium/:z/:x/:y.png` | Cached proxy for AWS `elevation-tiles-prod` Terrarium DEM tiles |
 | `POST /api/elevation/profile` | Samples `srtm30m` and `aster30m` along a transect polyline |
+| `POST /api/elevation/distance` | Computes WGS84 geodesic and SRTM/ASTER 3D terrain surface distances between two points |
 | `POST /api/elevation/diff-grid` | Computes a `9×9` `ASTER − SRTM` elevation difference grid |
 | `GET /api/geocode?q=...` | Geocoding place search proxy via Open-Meteo |

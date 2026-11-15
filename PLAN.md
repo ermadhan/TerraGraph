@@ -52,6 +52,16 @@
   - Dynamically projects edge coordinate tick labels (`38°N`, `122°W`, `0° EQ`, etc.) in `IBM Plex Mono`.
   - Accessible via both the **1° Graticule Grid (Lat/Lon)** checkbox in `ControlSidebar` and the **Grid** button in the top-right `MapViewport` toolbar.
 
+### Milestone 5 — 3D View Rotation & Geodesic Terrain Distance
+- **Full 3D Camera Orbit & Rotation Controls (`MapViewport`)**:
+  - Enabled native MapLibre rotation/tilt interactions (`dragRotate`, `pitchWithRotate`, `touchZoomRotate`, `touchPitch`, `keyboard`).
+  - Added a **Pan / Orbit Drag Mode** toggle in the top-right toolbar (`Orbit` mode enables single left-click drag to rotate bearing and pitch without modifier keys; `Shift`/`Alt` + left-drag and right-click drag also work at any time).
+  - Made the **3D Orientation Compass** directly draggable to smoothly orbit bearing and tilt pitch, alongside dedicated **Rotate Counter-Clockwise 45°**, **Rotate Clockwise 45°**, **Align North**, **Toggle 2D / 3D Tilt**, and **Reset Region (`RST`)** controls.
+- **3D Geodesic & Terrain-Aware Distance Tool (`src/utils/geodesic.ts` + `POST /api/elevation/distance`)**:
+  - Added `activeTool: 'measure-distance'`, triggered from either **Measure 3D Distance** in `ControlSidebar` or the top-right viewport toolbar.
+  - Clicking **Point A** and **Point B** draws a live great-circle preview arc, computes the WGS84 ellipsoidal geodesic distance and initial bearing (`A → B`) via Vincenty's inverse formula (`sampleGreatCircle` with spherical slerp), and queries OpenTopoData `srtm30m` and `aster30m` elevations (`12–80` samples) to integrate $\sum \sqrt{\Delta d^2 + \Delta h^2}$ terrain surface distances.
+  - Displays a floating **Geodesic & Terrain Distance** HUD card showing WGS84 Geodesic, Initial Bearing, 3D Surface (SRTM & ASTER) with `+relief %`, Endpoint Elevations (`A → B`), cumulative Ascent / Descent, and Max Grade `%`.
+
 ---
 
 ## 3. System Architecture
@@ -62,9 +72,11 @@
 │                                                                              │
 │  TopBar (Presets & Snapshot)                                                 │
 │  ├── ControlSidebar (Geocode Search · Projection · 1° Graticule · DEM Modes  │
-│  │                   Solar Azimuth · Overture Layers · Profile & Δh Grid)    │
+│  │                   Solar Azimuth · Overture Layers · Profile · 3D Distance │
+│  │                   Viewport Δh Discrepancy Grid)                           │
 │  ├── MapViewport (MapLibre GL JS 3D Globe/Terrain · PMTiles · dem-analysis://│
-│  │                3D Orientation Compass · 1° Graticule · Corner HUDs)       │
+│  │                geodesic.ts · Draggable 3D Compass · Orbit/Rotate Controls │
+│  │                1° Graticule · Geodesic/3D Distance HUD · Telemetry HUD)   │
 │  ├── FeatureInspector (Overture GERS ID · Schema Attributes · Provenance)    │
 │  └── TelemetryTray (SRTM vs ASTER SVG Profile · Δh Histogram · CSV Export)   │
 └───────────────────────────────────────┬──────────────────────────────────────┘
@@ -72,9 +84,11 @@
                                         ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                     Express Server (server.ts on Port 3000)                  │
+│  · GET  /api/health                  ──► Service health check                │
 │  · GET  /api/overture/config         ──► Overture STAC latest release lookup │
 │  · GET  /api/tiles/terrarium/:z/:x/:y.png ──► AWS elevation-tiles-prod proxy │
 │  · POST /api/elevation/profile       ──► OpenTopoData srtm30m + aster30m     │
+│  · POST /api/elevation/distance      ──► WGS84 + SRTM/ASTER 3D surface dist  │
 │  · POST /api/elevation/diff-grid     ──► OpenTopoData 9×9 bbox grid          │
 │  · GET  /api/geocode                 ──► Open-Meteo Geocoding proxy          │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -82,7 +96,14 @@
 
 ---
 
-## 4. Visual & UX Design Tokens
+## 4. Implemented Data Types & Design Tokens
+- **Core State Types (`src/types/geospatial.ts`)**:
+  - `TerrainMode`: `'hypsometric' | 'slope' | 'aspect' | 'natural'`
+  - `ElevationRampPreset`: `'scientific-terrain' | 'alpine-monochrome' | 'high-contrast'`
+  - `ActiveTool`: `'inspect' | 'profile-draw' | 'measure-distance'`
+  - `ProjectionMode`: `'globe' | 'mercator'`
+  - `DistanceMeasurementResult`: `{ pointA, pointB, geodesicMeters, initialBearingDeg, surfaceSrtmMeters, surfaceAsterMeters, elevASrtm, elevBSrtm, elevAAster, elevBAster, ascentSrtmMeters, descentSrtmMeters, maxGradePct, sampleCount, loading, error }`
 - **Theme**: Clean minimalist scientific explorer (`#F8FAFC` / `#FFFFFF` clinical canvas, `#E2E8F0` `1px` hairline borders, `#0F172A` slate ink).
-- **Accents**: Cobalt `#2563EB` (primary actions, NASA SRTM series, North needle, Equator/PM), Amber `#D97706` (ASTER GDEM series, solar controls), Cyan `#0891B2` (Overture structures & selection).
-- **Typography**: `Plus Jakarta Sans` for UI labels + `IBM Plex Mono` (`tabular-nums`) for coordinates, heading/pitch, elevation, slope, and GERS IDs.
+- **Accents**: Cobalt `#2563EB` (primary actions, NASA SRTM series, North needle, Equator/PM), Amber `#D97706` (ASTER GDEM series, solar controls), Cyan `#0891B2` (Overture structures & 3D distance arc).
+- **Typography**: `Plus Jakarta Sans` for UI labels + `IBM Plex Mono` (`tabular-nums`) for coordinates, heading/pitch, distances, elevation, slope, and GERS IDs.
+
