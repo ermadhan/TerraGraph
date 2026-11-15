@@ -3,9 +3,9 @@
 An interactive 3D scientific geospatial explorer combining **NASA SRTM 30m** and **NASA/METI ASTER GDEM 30m** global elevation models with **Overture Maps** man-made structures (3D extruded buildings, roads, rail, hydrology, and civil infrastructure).
 
 ## Key Features
-- **3D Globe & Terrain Mesh**: Switch seamlessly between 3D Globe and Mercator projections with adjustable vertical terrain exaggeration (`0.5×`–`3.0×`), live cursor elevation/slope/aspect telemetry, and PNG snapshot export.
+- **3D Globe & Terrain Mesh**: Switch seamlessly between 3D Globe and Mercator projections with adjustable vertical terrain exaggeration (`0.5×`–`4.0×`, default `1.8×`), live cursor elevation/slope/aspect telemetry, and PNG snapshot export.
 - **Real-Time Terrain Shaders**: Client-side Terrarium elevation decoder rendering **Hypsometric Elevation Bands**, **Slope Steepness (`0°–70°`)**, **Aspect Compass Bearing (`0°–360°`)**, and **Natural Relief** alongside interactive **Solar Azimuth & Hillshade** controls.
-- **Overture Maps Vector Streaming**: Streams official Overture Maps PMTiles (`buildings`, `transportation`, `base`) directly from AWS S3 with an interactive **Attribute & Provenance Inspector** for clicking 3D buildings, road segments, and infrastructure.
+- **Overture Maps Vector Streaming**: Streams official Overture Maps PMTiles (`buildings`, `transportation`, `base`) directly from AWS S3 — draping `land_cover`, `land_use`, `water`, `infrastructure`, and `segment` roads onto the 3D terrain mesh and seating 3D extruded buildings at true ground elevation with an interactive **Attribute & Provenance Inspector**.
 - **SRTM 30m vs. ASTER 30m Analysis**:
   - **Cross-Section Profiler**: Draw multi-point transects across terrain to plot dual-curve `SRTM 30m` vs. `ASTER 30m` elevation profiles, synchronized 3D cursor scrubbing, RMSE/mean bias stats, and CSV export.
   - **3D Geodesic & Terrain Distance**: Click two points (`A` & `B`) to compute the WGS84 ellipsoidal geodesic distance, initial bearing, SRTM 30m & ASTER 30m terrain-integrated 3D surface distances (`+relief %`), endpoint elevations, ascent/descent, and max grade.

@@ -143,12 +143,13 @@ function getElevationRampExpression(ramp: ElevationRampPreset): maplibregl.Expre
     ['elevation'],
     -100, '#DBEAFE',
     0, '#E2E8F0',
-    40, '#F1F5F9',
-    250, '#D9E8D8',
-    700, '#E8DFC5',
-    1500, '#D4B895',
-    2600, '#A88A73',
-    3800, '#F8FAFC',
+    35, '#EBF3EC',
+    120, '#D4E7D4',
+    320, '#E6DFC2',
+    750, '#D8BF98',
+    1500, '#BF9772',
+    2500, '#96745B',
+    3600, '#F8FAFC',
   ];
 }
 
@@ -300,10 +301,13 @@ export const MapViewport: React.FC<MapViewportProps> = ({
   onSelectFeatureRef.current = onSelectFeature;
 
   const sampleTimerRef = useRef<number | null>(null);
+  const appliedExaggerationRef = useRef<number>(exaggeration);
 
   useEffect(() => {
     if (!containerRef.current) return;
     ensureProtocols();
+    const terrariumTileUrl = `${window.location.origin}/api/tiles/terrarium/{z}/{x}/{y}.png`;
+    appliedExaggerationRef.current = exaggeration;
 
     const style: StyleSpecification = {
       version: 8,
@@ -311,7 +315,14 @@ export const MapViewport: React.FC<MapViewportProps> = ({
       sources: {
         'terrarium-dem': {
           type: 'raster-dem',
-          tiles: ['/api/tiles/terrarium/{z}/{x}/{y}.png'],
+          tiles: [terrariumTileUrl],
+          tileSize: 256,
+          maxzoom: 15,
+          encoding: 'terrarium',
+        },
+        'terrarium-shading-dem': {
+          type: 'raster-dem',
+          tiles: [terrariumTileUrl],
           tileSize: 256,
           maxzoom: 15,
           encoding: 'terrarium',
@@ -383,7 +394,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
         {
           id: 'terrain-color-relief',
           type: 'color-relief',
-          source: 'terrarium-dem',
+          source: 'terrarium-shading-dem',
           layout: {
             visibility: terrainMode === 'hypsometric' || terrainMode === 'natural' ? 'visible' : 'none',
           },
@@ -409,7 +420,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
         {
           id: 'terrain-hillshade',
           type: 'hillshade',
-          source: 'terrarium-dem',
+          source: 'terrarium-shading-dem',
           paint: {
             'hillshade-exaggeration': hillshadeIntensity,
             'hillshade-illumination-direction': sunAzimuth,
@@ -440,14 +451,35 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           },
         },
         {
+          id: 'overture-land-cover',
+          type: 'fill',
+          source: 'overture-base',
+          'source-layer': 'land_cover',
+          layout: { visibility: overtureLayers.waterAndLand ? 'visible' : 'none' },
+          paint: {
+            'fill-color': [
+              'match',
+              ['get', 'subtype'],
+              'forest', '#BBF7D0',
+              'grass', '#DCFCE7',
+              'shrub', '#E5E7EB',
+              'barren', '#FDE68A',
+              'wetland', '#BAE6FD',
+              'snow', '#F8FAFC',
+              '#E2E8F0',
+            ],
+            'fill-opacity': 0.22,
+          },
+        },
+        {
           id: 'overture-land-use',
           type: 'fill',
           source: 'overture-base',
           'source-layer': 'land_use',
           layout: { visibility: overtureLayers.waterAndLand ? 'visible' : 'none' },
           paint: {
-            'fill-color': '#E2E8F0',
-            'fill-opacity': 0.25,
+            'fill-color': '#CBD5E1',
+            'fill-opacity': 0.24,
           },
         },
         {
@@ -478,7 +510,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           type: 'line',
           source: 'overture-transportation',
           'source-layer': 'segment',
-          minzoom: 10,
+          minzoom: 7,
           layout: {
             visibility: overtureLayers.transportation ? 'visible' : 'none',
             'line-cap': 'round',
@@ -486,7 +518,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           },
           paint: {
             'line-color': '#CBD5E1',
-            'line-width': ['interpolate', ['linear'], ['zoom'], 10, 0.8, 14, 4.5, 17, 9],
+            'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.6, 10, 1.4, 14, 4.5, 17, 9],
           },
         },
         {
@@ -494,7 +526,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           type: 'line',
           source: 'overture-transportation',
           'source-layer': 'segment',
-          minzoom: 10,
+          minzoom: 7,
           layout: {
             visibility: overtureLayers.transportation ? 'visible' : 'none',
             'line-cap': 'round',
@@ -511,7 +543,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
               'rail', '#475569',
               '#FFFFFF',
             ],
-            'line-width': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 14, 2.5, 17, 6],
+            'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.4, 10, 0.9, 14, 2.5, 17, 6],
           },
         },
         {
@@ -519,26 +551,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           type: 'fill-extrusion',
           source: 'overture-buildings',
           'source-layer': 'building',
-          minzoom: 11,
-          layout: { visibility: overtureLayers.buildings ? 'visible' : 'none' },
-          paint: {
-            'fill-extrusion-color': '#94A3B8',
-            'fill-extrusion-height': [
-              'coalesce',
-              ['get', 'height'],
-              ['*', ['coalesce', ['get', 'num_floors'], 2], 3.5],
-              7,
-            ],
-            'fill-extrusion-base': ['coalesce', ['get', 'min_height'], 0],
-            'fill-extrusion-opacity': 0.9,
-          },
-        },
-        {
-          id: 'overture-building-parts-3d',
-          type: 'fill-extrusion',
-          source: 'overture-buildings',
-          'source-layer': 'building_part',
-          minzoom: 13,
+          minzoom: 9,
           layout: { visibility: overtureLayers.buildings ? 'visible' : 'none' },
           paint: {
             'fill-extrusion-color': '#64748B',
@@ -553,11 +566,30 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           },
         },
         {
+          id: 'overture-building-parts-3d',
+          type: 'fill-extrusion',
+          source: 'overture-buildings',
+          'source-layer': 'building_part',
+          minzoom: 12,
+          layout: { visibility: overtureLayers.buildings ? 'visible' : 'none' },
+          paint: {
+            'fill-extrusion-color': '#475569',
+            'fill-extrusion-height': [
+              'coalesce',
+              ['get', 'height'],
+              ['*', ['coalesce', ['get', 'num_floors'], 2], 3.5],
+              7,
+            ],
+            'fill-extrusion-base': ['coalesce', ['get', 'min_height'], 0],
+            'fill-extrusion-opacity': 0.94,
+          },
+        },
+        {
           id: 'overture-selected-highlight',
           type: 'fill-extrusion',
           source: 'overture-buildings',
           'source-layer': 'building',
-          minzoom: 11,
+          minzoom: 9,
           filter: ['==', ['get', 'id'], '__none__'],
           paint: {
             'fill-extrusion-color': '#0891B2',
@@ -908,10 +940,12 @@ export const MapViewport: React.FC<MapViewportProps> = ({
     }
   }, [showGraticule, mapReady]);
 
-  // Update terrain exaggeration
+  // Update terrain exaggeration without needlessly rebuilding terrain on initial mount
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
+    if (appliedExaggerationRef.current === exaggeration) return;
+    appliedExaggerationRef.current = exaggeration;
     map.setTerrain({ source: 'terrarium-dem', exaggeration });
   }, [exaggeration, mapReady]);
 
@@ -992,6 +1026,11 @@ export const MapViewport: React.FC<MapViewportProps> = ({
       'visibility',
       overtureLayers.waterAndLand ? 'visible' : 'none',
     );
+    map.setLayoutProperty(
+      'overture-land-cover',
+      'visibility',
+      overtureLayers.waterAndLand ? 'visible' : 'none',
+    );
 
     const colorExpr: maplibregl.DataDrivenPropertyValueSpecification<string> =
       buildingColorMode === 'height'
@@ -1005,7 +1044,7 @@ export const MapViewport: React.FC<MapViewportProps> = ({
             120, '#0891B2',
             220, '#D97706',
           ]
-        : '#94A3B8';
+        : '#64748B';
 
     map.setPaintProperty('overture-buildings-3d', 'fill-extrusion-color', colorExpr);
   }, [overtureLayers, buildingColorMode, mapReady]);

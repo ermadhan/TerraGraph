@@ -46,7 +46,7 @@ export default function App() {
   const [showGraticule, setShowGraticule] = useState<boolean>(true);
   const [terrainMode, setTerrainMode] = useState<TerrainMode>('hypsometric');
   const [elevationRamp, setElevationRamp] = useState<ElevationRampPreset>('scientific-terrain');
-  const [exaggeration, setExaggeration] = useState<number>(1.4);
+  const [exaggeration, setExaggeration] = useState<number>(1.8);
   const [sunAzimuth, setSunAzimuth] = useState<number>(315);
   const [hillshadeIntensity, setHillshadeIntensity] = useState<number>(0.55);
 

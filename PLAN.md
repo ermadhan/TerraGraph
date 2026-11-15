@@ -14,12 +14,12 @@
 ### Milestone 1 — Core 3D Engine & Data Pipeline
 - **3D Globe & Terrain Mesh (`MapViewport`)**:
   - Uses MapLibre GL JS (`v6.18.0`) with switchable **3D Globe** and **Mercator** projections.
-  - Streams global 24-bit Terrarium elevation PNGs from AWS `elevation-tiles-prod` via `/api/tiles/terrarium/:z/:x/:y.png` (LRU-cached in Express to avoid CORS canvas tainting).
-  - Supports vertical exaggeration (`0.5×`–`3.0×`), sky atmosphere blending, and PNG canvas snapshot export (`preserveDrawingBuffer: true`).
+  - Streams global 24-bit Terrarium elevation PNGs from AWS `elevation-tiles-prod` via `/api/tiles/terrarium/:z/:x/:y.png` (LRU-cached in Express to avoid CORS canvas tainting), using dedicated `terrarium-dem` (3D mesh displacement) and `terrarium-shading-dem` (`color-relief` / `hillshade`) sources to prevent MapLibre tile-LOD contention.
+  - Supports vertical exaggeration (`0.5×`–`4.0×`, default `1.8×` with quick presets), sky atmosphere blending, and PNG canvas snapshot export (`preserveDrawingBuffer: true`).
 - **Overture Maps Vector Streaming (`ControlSidebar` + `FeatureInspector`)**:
   - Express dynamically resolves the latest monthly Overture release from `https://stac.overturemaps.org/catalog.json` (with `2026-10-21.0` fallback) via `GET /api/overture/config`.
   - Streams `buildings.pmtiles`, `transportation.pmtiles`, and `base.pmtiles` directly from AWS S3 via the `pmtiles://` protocol.
-  - Extrudes `building` and `building_part` layers in 3D (supporting Architectural Slate and Height Spectrum coloring) alongside roads, rail, hydrology, and civil infrastructure.
+  - Extrudes `building` (`minzoom: 9`) and `building_part` (`minzoom: 12`) layers in 3D seated directly onto terrain elevation (supporting Architectural Slate and Height Spectrum coloring), alongside terrain-draped `segment` roads (`minzoom: 7`), `land_cover`, `land_use`, `water`, and civil `infrastructure`.
   - Clicking any Overture feature opens the right-hand **Feature Inspector** showing its GERS ID, physical dimensions (`height`, `num_floors`, `roof_shape`, `surface`), schema properties, and contributor `sources`.
 
 ### Milestone 2 — Terrain Shaders & Solar Simulation

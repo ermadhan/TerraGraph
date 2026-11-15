@@ -334,12 +334,28 @@ export const ControlSidebar: React.FC<ControlSidebarProps> = ({
             <input
               type="range"
               min={0.5}
-              max={3.0}
+              max={4.0}
               step={0.1}
               value={exaggeration}
               onChange={(e) => onChangeExaggeration(Number(e.target.value))}
               className="w-full sci-slider"
             />
+            <div className="grid grid-cols-4 gap-1">
+              {[1.0, 1.8, 2.5, 3.5].map((val) => (
+                <button
+                  key={val}
+                  type="button"
+                  onClick={() => onChangeExaggeration(val)}
+                  className={`py-0.5 text-[10px] font-mono rounded border transition-colors cursor-pointer ${
+                    Math.abs(exaggeration - val) < 0.05
+                      ? 'bg-blue-50 border-blue-200 text-blue-700 font-medium'
+                      : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {val.toFixed(1)}×
+                </button>
+              ))}
+            </div>
           </div>
         </section>
 
