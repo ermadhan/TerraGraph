@@ -1,0 +1,6 @@
+{
+  "name": "TerraGraph",
+  "description": "Interactive 3D scientific geospatial explorer combining NASA SRTM and ASTER global elevation models with Overture Maps man-made structures.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
