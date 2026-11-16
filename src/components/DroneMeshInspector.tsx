@@ -4,6 +4,7 @@ import * as maplibregl from 'maplibre-gl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
+  Activity,
   Box,
   ChevronDown,
   ChevronUp,
@@ -114,6 +115,41 @@ function createPlinthGridTexture(): THREE.CanvasTexture {
   return tex;
 }
 
+type InspectorViewMode = 'structure' | 'clearance-heatmap';
+
+function lerpRgb(
+  a: [number, number, number],
+  b: [number, number, number],
+  t: number,
+): [number, number, number] {
+  const k = Math.max(0, Math.min(1, t));
+  return [
+    a[0] + (b[0] - a[0]) * k,
+    a[1] + (b[1] - a[1]) * k,
+    a[2] + (b[2] - a[2]) * k,
+  ];
+}
+
+function clearanceToHeatRgb(clrMeters: number, maxClearanceMeters: number): [number, number, number] {
+  const cBreach: [number, number, number] = [0.75, 0.07, 0.24]; // Deep Crimson (<0m)
+  const cCritical: [number, number, number] = [0.94, 0.27, 0.27]; // Vivid Red (0m)
+  const cCaution: [number, number, number] = [0.96, 0.62, 0.04]; // Amber (15m)
+  const cNominal: [number, number, number] = [0.06, 0.73, 0.51]; // Emerald (40m)
+  const cClear: [number, number, number] = [0.01, 0.52, 0.78]; // Deep Cyan-Blue (>=max)
+
+  if (clrMeters < 0) {
+    return lerpRgb(cCritical, cBreach, Math.min(1, Math.abs(clrMeters) / 18 + 0.35));
+  }
+  if (clrMeters < 15) {
+    return lerpRgb(cCritical, cCaution, clrMeters / 15);
+  }
+  if (clrMeters < 40) {
+    return lerpRgb(cCaution, cNominal, (clrMeters - 15) / 25);
+  }
+  const upper = Math.max(85, maxClearanceMeters);
+  return lerpRgb(cNominal, cClear, (clrMeters - 40) / Math.max(1, upper - 40));
+}
+
 export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
   grid,
   loading,
@@ -126,8 +162,27 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [dockCollapsed, setDockCollapsed] = useState(false);
+  const [viewMode, setViewMode] = useState<InspectorViewMode>('structure');
   const [showBlockedCells, setShowBlockedCells] = useState(true);
   const [hoverTelemetry, setHoverTelemetry] = useState<HoverInspectTelemetry | null>(null);
+
+  const clearanceStats = React.useMemo(() => {
+    if (!grid || grid.clearance.length === 0) return { min: 0, max: 120, criticalCount: 0 };
+    let min = Infinity;
+    let max = -Infinity;
+    let criticalCount = 0;
+    for (let i = 0; i < grid.clearance.length; i++) {
+      const c = grid.clearance[i];
+      if (c < min) min = c;
+      if (c > max) max = c;
+      if (c < 15) criticalCount++;
+    }
+    return {
+      min: Math.round(min * 10) / 10,
+      max: Math.round(Math.max(40, max) * 10) / 10,
+      criticalCount,
+    };
+  }, [grid]);
 
   const blockedCellStats = React.useMemo(() => {
     if (!grid) return { core: 0, buffer: 0, total: 0 };
@@ -167,6 +222,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
   exaggerationRef.current = exaggeration;
   const prevGridRef = useRef<DroneAirspaceGrid | null>(null);
   const prevCapturedAtRef = useRef<string | null>(null);
+  const prevViewModeRef = useRef<InspectorViewMode>('structure');
   const hasFramedRef = useRef(false);
 
   const sceneCtxRef = useRef<{
@@ -677,7 +733,9 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       return { fillGeo, lineGeo, positions, minY, maxSurfY };
     };
 
-    // 1. Solid SRTM/ASTER Terrain Mesh
+    // 1. Solid SRTM/ASTER Terrain Mesh (Hypsometric + Blocked Cells OR Drone Clearance Heatmap)
+    const isHeatmapMode = viewMode === 'clearance-heatmap';
+    const maxClrScale = clearanceStats.max;
     const elevRange = Math.max(1, maxTerrainMeters - minTerrainMeters);
     const {
       fillGeo: terrainGeo,
@@ -687,6 +745,10 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     } = buildGridSurfaceGeo(
       (idx) => elevToY(terrainElev[idx]),
       (idx) => {
+        if (isHeatmapMode) {
+          return clearanceToHeatRgb(clearance[idx], maxClrScale);
+        }
+
         const t = Math.max(0, Math.min(1, (terrainElev[idx] - minTerrainMeters) / elevRange));
         // Clean hypsometric slate-emerald-ochre scientific ramp
         let r: number;
@@ -842,6 +904,22 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       topY: number;
     } | null = null;
 
+    const heatBuildingMats = new Map<number, THREE.MeshStandardMaterial>();
+    const getHeatBuildingMat = (clrMeters: number): THREE.MeshStandardMaterial => {
+      const bucket = Math.round(clrMeters / 4) * 4;
+      const existing = heatBuildingMats.get(bucket);
+      if (existing) return existing;
+      const [hr, hg, hb] = clearanceToHeatRgb(bucket, maxClrScale);
+      const mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(hr, hg, hb),
+        roughness: 0.46,
+        metalness: 0.12,
+      });
+      mat.userData.isBaseGeo = true;
+      heatBuildingMats.set(bucket, mat);
+      return mat;
+    };
+
     for (let bIdx = 0; bIdx < maxRenderBuildings; bIdx++) {
       const b = buildings[bIdx];
       if (b.ring.length < 3) continue;
@@ -891,7 +969,8 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         config.altitudeMode === 'agl'
           ? groundElev + config.ceilingMeters
           : config.ceilingMeters;
-      const isViolating = bTerrainMax + b.heightMeters + config.verticalBufferMeters > bCeiling;
+      const bClearance = bCeiling - (bTerrainMax + b.heightMeters + config.verticalBufferMeters);
+      const isViolating = bClearance < 0;
 
       try {
         const geo = new THREE.ExtrudeGeometry(shape, {
@@ -900,7 +979,12 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
           steps: 1,
         });
         geo.rotateX(-Math.PI / 2);
-        const mesh = new THREE.Mesh(geo, isViolating ? breachBuildingMat : safeBuildingMat);
+        const bMat = isHeatmapMode
+          ? getHeatBuildingMat(bClearance)
+          : isViolating
+            ? breachBuildingMat
+            : safeBuildingMat;
+        const mesh = new THREE.Mesh(geo, bMat);
         mesh.position.y = baseY;
         mesh.castShadow = ctx.renderer.shadowMap.enabled;
         mesh.receiveShadow = ctx.renderer.shadowMap.enabled;
@@ -933,6 +1017,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         y10: number;
         y01: number;
         y11: number;
+        minClr: number;
         isCore: boolean;
         isBreach: boolean;
       }
@@ -1007,6 +1092,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
             y10: elevToY(terrainElev[i10]) + 0.06,
             y01: elevToY(terrainElev[i01]) + 0.06,
             y11: elevToY(terrainElev[i11]) + 0.06,
+            minClr,
             isCore,
             isBreach,
           });
@@ -1019,7 +1105,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         const voxelMat = new THREE.MeshStandardMaterial({
           color: '#FFFFFF',
           transparent: true,
-          opacity: 0.34,
+          opacity: isHeatmapMode ? 0.28 : 0.34,
           roughness: 0.38,
           metalness: 0.05,
           depthWrite: false,
@@ -1043,7 +1129,10 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
           dummy.updateMatrix();
           voxelMesh.setMatrixAt(idx, dummy.matrix);
 
-          if (cell.isCore && cell.isBreach) {
+          if (isHeatmapMode) {
+            const [hr, hg, hb] = clearanceToHeatRgb(cell.minClr, maxClrScale);
+            color.setRGB(hr, hg, hb);
+          } else if (cell.isCore && cell.isBreach) {
             color.set('#DC2626'); // Deep Crimson: building footprint breaching ceiling
           } else if (cell.isCore) {
             color.set('#EF4444'); // Vivid Red: direct building geometry obstruction
@@ -1052,7 +1141,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
           }
           voxelMesh.setColorAt(idx, color);
 
-          // Red/amber tinted ground quad per blocked cell
+          // Red/amber tinted ground quad per blocked cell (omitted in heatmap mode so terrain clearance gradient stays crisp)
           const [tr, tg, tb] = cell.isCore ? [0.94, 0.24, 0.28] : [0.96, 0.62, 0.12];
           const pOff = idx * 18;
           tilePositions[pOff] = cell.x0;
@@ -1081,7 +1170,11 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
             tileColors[pOff + k * 3 + 2] = tb;
           }
 
-          const [br, bg, bb] = cell.isCore ? [0.85, 0.11, 0.2] : [0.85, 0.47, 0.04];
+          const [br, bg, bb] = isHeatmapMode
+            ? clearanceToHeatRgb(cell.minClr, maxClrScale)
+            : cell.isCore
+              ? [0.85, 0.11, 0.2]
+              : [0.85, 0.47, 0.04];
           borderPositions.push(
             cell.x0, cell.y00 + 0.02, cell.z0, cell.x1, cell.y10 + 0.02, cell.z0,
             cell.x1, cell.y10 + 0.02, cell.z0, cell.x1, cell.y11 + 0.02, cell.z1,
@@ -1097,19 +1190,21 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         if (voxelMesh.instanceColor) voxelMesh.instanceColor.needsUpdate = true;
         ctx.dynamicGroup.add(voxelMesh);
 
-        const tileGeo = new THREE.BufferGeometry();
-        tileGeo.setAttribute('position', new THREE.BufferAttribute(tilePositions, 3));
-        tileGeo.setAttribute('color', new THREE.BufferAttribute(tileColors, 3));
-        const tileMat = new THREE.MeshBasicMaterial({
-          vertexColors: true,
-          transparent: true,
-          opacity: 0.42,
-          depthWrite: false,
-          side: THREE.DoubleSide,
-        });
-        const tileMesh = new THREE.Mesh(tileGeo, tileMat);
-        tileMesh.renderOrder = 1;
-        ctx.dynamicGroup.add(tileMesh);
+        if (!isHeatmapMode) {
+          const tileGeo = new THREE.BufferGeometry();
+          tileGeo.setAttribute('position', new THREE.BufferAttribute(tilePositions, 3));
+          tileGeo.setAttribute('color', new THREE.BufferAttribute(tileColors, 3));
+          const tileMat = new THREE.MeshBasicMaterial({
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.42,
+            depthWrite: false,
+            side: THREE.DoubleSide,
+          });
+          const tileMesh = new THREE.Mesh(tileGeo, tileMat);
+          tileMesh.renderOrder = 1;
+          ctx.dynamicGroup.add(tileMesh);
+        }
 
         const borderGeo = new THREE.BufferGeometry();
         borderGeo.setAttribute('position', new THREE.Float32BufferAttribute(borderPositions, 3));
@@ -1117,7 +1212,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         const borderMat = new THREE.LineBasicMaterial({
           vertexColors: true,
           transparent: true,
-          opacity: 0.85,
+          opacity: isHeatmapMode ? 0.55 : 0.85,
         });
         const borderLines = new THREE.LineSegments(borderGeo, borderMat);
         borderLines.renderOrder = 2;
@@ -1140,6 +1235,9 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         (idx) => elevToY(envelopeElev[idx]) + 0.08,
         (idx) => {
           const clr = clearance[idx];
+          if (isHeatmapMode) {
+            return clearanceToHeatRgb(clr, maxClrScale);
+          }
           const rawB = rawBuildingHeight[idx];
           const bH = bufferedBuildingHeight[idx];
           if (clr < 0) return [0.88, 0.11, 0.28]; // Violation Rose
@@ -1208,7 +1306,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       const ceilMat = new THREE.MeshPhysicalMaterial({
         vertexColors: true,
         transparent: true,
-        opacity: config.ceilingOpacity,
+        opacity: isHeatmapMode ? Math.min(0.24, config.ceilingOpacity * 0.65) : config.ceilingOpacity,
         roughness: 0.22,
         metalness: 0.08,
         depthWrite: false,
@@ -1368,8 +1466,10 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 
     const isResampledGrid = grid.capturedAt !== prevCapturedAtRef.current;
     const isUpdatedGrid = grid !== prevGridRef.current;
+    const isViewModeChanged = viewMode !== prevViewModeRef.current;
     prevGridRef.current = grid;
     prevCapturedAtRef.current = grid.capturedAt;
+    prevViewModeRef.current = viewMode;
 
     ctx.worldBounds = { width: worldW, depth: worldD, maxY, sceneScale };
     if (!hasFramedRef.current) {
@@ -1382,7 +1482,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    if ((isResampledGrid || isUpdatedGrid) && !prefersReducedMotion) {
+    if ((isResampledGrid || isUpdatedGrid || isViewModeChanged) && !prefersReducedMotion) {
       const seenMaterials = new Set<THREE.Material>();
       const fadeEntries: Array<{
         material: THREE.Material;
@@ -1399,13 +1499,13 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         for (const m of mats) {
           if (seenMaterials.has(m)) continue;
           seenMaterials.add(m);
-          if (!isResampledGrid && m.userData?.isBaseGeo) continue;
+          if (!isResampledGrid && !isViewModeChanged && m.userData?.isBaseGeo) continue;
           fadeEntries.push({
             material: m,
             targetOpacity: m.opacity,
             baseTransparent: m.transparent,
             baseDepthWrite: m.depthWrite,
-            startFactor: isResampledGrid ? 0.08 : 0.55,
+            startFactor: isResampledGrid ? 0.08 : isViewModeChanged ? 0.42 : 0.55,
           });
         }
       });
@@ -1414,7 +1514,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     } else {
       ctx.requestRender();
     }
-  }, [grid, config, corridorAnalysis, exaggeration, showBlockedCells]);
+  }, [grid, config, corridorAnalysis, exaggeration, showBlockedCells, viewMode, clearanceStats.max]);
 
   const statusBadge = (() => {
     if (!grid) return { label: 'NO GRID', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
@@ -1547,28 +1647,44 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 
           {/* Top-Left Compact Color Key & Hover Readout (Solid opaque surface, zero backdrop-blur) */}
           <div className="pointer-events-none absolute top-3 left-3 flex flex-col gap-2 z-10">
-            <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[10px] font-mono text-slate-700 flex flex-wrap items-center gap-3 shadow-xs">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-xs bg-red-500 inline-block" />
-                Blocked Cell (Bldg)
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-xs bg-amber-400 inline-block" />
-                Buffer Voxel
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-xs bg-teal-600 inline-block" />
-                Buffer Envelope
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-xs bg-cyan-500 inline-block" />
-                Safe Ceiling
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-xs bg-rose-600 inline-block" />
-                Breach (&lt;0m)
-              </span>
-            </div>
+            {viewMode === 'clearance-heatmap' ? (
+              <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[10px] font-mono tabular-nums text-slate-700 flex flex-col gap-1.5 shadow-xs min-w-[270px]">
+                <div className="flex items-center justify-between gap-4">
+                  <span className="font-semibold text-slate-900">Clearance Proximity Heatmap</span>
+                  <span className="text-slate-500">{clearanceStats.criticalCount} pts &lt;15m</span>
+                </div>
+                <div className="h-2 w-full rounded-xs bg-[linear-gradient(90deg,#BE123C_0%,#EF4444_18%,#F59E0B_38%,#10B981_65%,#0284C7_100%)]" />
+                <div className="flex items-center justify-between text-[9px] text-slate-500">
+                  <span className="text-rose-700 font-semibold">&lt;0m Breach</span>
+                  <span>15m Critical</span>
+                  <span>40m Safe</span>
+                  <span className="text-sky-700 font-semibold">≥{Math.round(clearanceStats.max)}m Clear</span>
+                </div>
+              </div>
+            ) : (
+              <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[10px] font-mono text-slate-700 flex flex-wrap items-center gap-3 shadow-xs">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-red-500 inline-block" />
+                  Blocked Cell (Bldg)
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-amber-400 inline-block" />
+                  Buffer Voxel
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-teal-600 inline-block" />
+                  Buffer Envelope
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-cyan-500 inline-block" />
+                  Safe Ceiling
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-rose-600 inline-block" />
+                  Breach (&lt;0m)
+                </span>
+              </div>
+            )}
 
             {hoverTelemetry && (
               <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[11px] font-mono tabular-nums text-slate-700 shadow-xs space-y-0.5 max-w-[300px]">
@@ -1657,14 +1773,42 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 
             {!dockCollapsed && (
               <div className="bg-white border border-slate-200 rounded-lg shadow-md px-4 py-3 flex flex-wrap items-center gap-x-5 gap-y-2.5 text-xs">
+                {/* Visualization Mode Switcher */}
+                <div className="flex bg-slate-100 p-0.5 rounded border border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode('structure')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                      viewMode === 'structure'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Layers className="w-3 h-3" />
+                    Structure
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode('clearance-heatmap')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                      viewMode === 'clearance-heatmap'
+                        ? 'bg-white text-rose-700 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Activity className="w-3 h-3" />
+                    Clearance Heatmap
+                  </button>
+                </div>
+
                 {/* Layer Toggles */}
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5 border-l border-slate-200 pl-4">
                   <button
                     type="button"
                     onClick={() =>
                       onChangeConfig((p) => ({ ...p, showEnvelopeMesh: !p.showEnvelopeMesh }))
                     }
-                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
                       config.showEnvelopeMesh
                         ? 'bg-teal-50 border-teal-200 text-teal-800'
                         : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
@@ -1678,7 +1822,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                     onClick={() =>
                       onChangeConfig((p) => ({ ...p, showCeilingMesh: !p.showCeilingMesh }))
                     }
-                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
                       config.showCeilingMesh
                         ? 'bg-cyan-50 border-cyan-200 text-cyan-800'
                         : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
@@ -1692,7 +1836,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                     onClick={() =>
                       onChangeConfig((p) => ({ ...p, showWireframe: !p.showWireframe }))
                     }
-                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
                       config.showWireframe
                         ? 'bg-blue-50 border-blue-200 text-blue-800'
                         : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
@@ -1706,7 +1850,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                     onClick={() =>
                       onChangeConfig((p) => ({ ...p, autoClimbCorridor: !p.autoClimbCorridor }))
                     }
-                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
                       config.autoClimbCorridor
                         ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                         : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
@@ -1718,7 +1862,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                   <button
                     type="button"
                     onClick={() => setShowBlockedCells((v) => !v)}
-                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
                       showBlockedCells
                         ? 'bg-red-50 border-red-200 text-red-800'
                         : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
