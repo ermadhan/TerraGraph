@@ -2,11 +2,91 @@ export type TerrainMode = 'hypsometric' | 'slope' | 'aspect' | 'natural';
 
 export type BuildingColorMode = 'architectural' | 'height';
 
-export type ActiveTool = 'inspect' | 'profile-draw' | 'measure-distance';
+export type ActiveTool = 'inspect' | 'profile-draw' | 'measure-distance' | 'drone-corridor';
 
 export type ProjectionMode = 'globe' | 'mercator';
 
 export type ElevationRampPreset = 'scientific-terrain' | 'alpine-monochrome' | 'high-contrast';
+
+export type DroneAltitudeMode = 'agl' | 'msl';
+
+export interface DroneZoneConfig {
+  enabled: boolean;
+  showMapOverlay: boolean;
+  showInspectorModal: boolean;
+  showEnvelopeMesh: boolean;
+  showCeilingMesh: boolean;
+  showWireframe: boolean;
+  altitudeMode: DroneAltitudeMode;
+  ceilingMeters: number;
+  verticalBufferMeters: number;
+  horizontalBufferMeters: number;
+  envelopeOpacity: number;
+  ceilingOpacity: number;
+}
+
+export interface DroneBuildingFootprint {
+  id: string;
+  title: string;
+  heightMeters: number;
+  minHeightMeters: number;
+  ring: Array<[number, number]>;
+}
+
+export interface DroneAirspaceGrid {
+  bbox: [number, number, number, number];
+  center: [number, number];
+  cols: number;
+  rows: number;
+  widthMeters: number;
+  depthMeters: number;
+  terrainElev: Float32Array;
+  rawBuildingHeight: Float32Array;
+  bufferedBuildingHeight: Float32Array;
+  envelopeElev: Float32Array;
+  ceilingElev: Float32Array;
+  clearance: Float32Array;
+  minTerrainMeters: number;
+  maxTerrainMeters: number;
+  maxBuildingHeightMeters: number;
+  maxObstacleElevMeters: number;
+  minClearanceMeters: number;
+  violationCellCount: number;
+  cautionCellCount: number;
+  totalCells: number;
+  violationPct: number;
+  buildingCount: number;
+  demTilesLoaded: number;
+  buildings: DroneBuildingFootprint[];
+  capturedAt: string;
+}
+
+export interface DroneCorridorSample {
+  index: number;
+  distanceMeters: number;
+  lon: number;
+  lat: number;
+  terrainMeters: number;
+  buildingHeightMeters: number;
+  envelopeMeters: number;
+  ceilingMeters: number;
+  clearanceMeters: number;
+  status: 'CLEAR' | 'CAUTION' | 'VIOLATION';
+}
+
+export interface DroneCorridorAnalysis {
+  waypoints: Array<[number, number]>;
+  samples: DroneCorridorSample[];
+  summary: {
+    totalLengthMeters: number;
+    minClearanceMeters: number;
+    maxEnvelopeMeters: number;
+    maxBuildingMeters: number;
+    violationSampleCount: number;
+    cautionSampleCount: number;
+    status: 'CLEAR' | 'CAUTION' | 'VIOLATION';
+  };
+}
 
 export interface RegionPreset {
   id: string;

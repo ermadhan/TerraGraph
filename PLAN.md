@@ -62,6 +62,16 @@
   - Clicking **Point A** and **Point B** draws a live great-circle preview arc, computes the WGS84 ellipsoidal geodesic distance and initial bearing (`A → B`) via Vincenty's inverse formula (`sampleGreatCircle` with spherical slerp), and queries OpenTopoData `srtm30m` and `aster30m` elevations (`12–80` samples) to integrate $\sum \sqrt{\Delta d^2 + \Delta h^2}$ terrain surface distances.
   - Displays a floating **Geodesic & Terrain Distance** HUD card showing WGS84 Geodesic, Initial Bearing, 3D Surface (SRTM & ASTER) with `+relief %`, Endpoint Elevations (`A → B`), cumulative Ascent / Descent, and Max Grade `%`.
 
+### Milestone 6 — Opt-In 3D Drone Flight Zone Mesh & Airspace Inspector
+- **Shared Airspace Modeling Engine (`src/utils/droneAirspace.ts`)**:
+  - Samples a `52×52` bilinearly interpolated grid centered on the camera's true focal point (`map.getCenter()`) directly from decoded AWS Terrarium DEM tiles (`fetchDecodedDemTile`, with lower-zoom fallback) and captures rendered Overture 3D building footprints (`overture-buildings-3d`, `overture-building-parts-3d`, plus automatic `idle` capture once streaming PMTiles settle).
+  - Synthesizes a **Composite Obstacle Envelope** (`terrain + bufferedBuildingHeight + verticalBufferMeters`, with exact Euclidean point-to-polygon `horizontalBufferMeters` dilation) and a **Safe Flight Ceiling Surface** selectable in **AGL** (terrain-following) or **MSL** (flat datum) meters.
+  - Evaluates net vertical clearance (`ceilingElev − envelopeElev`), AOI breach percentages, and clickable multi-waypoint flight corridors (`analyzeDroneCorridor` returning `'CLEAR' | 'CAUTION' | 'VIOLATION'` segment status, minimum clearance, and violation sample count).
+- **Strictly Opt-In Dual Rendering Architecture**:
+  - Disabled by default (`DEFAULT_DRONE_ZONE_CONFIG.enabled = false`) and controllable via TopBar button, sidebar switch, top-right viewport toggle button, and independent checkboxes/selectors for **Live Map 3D Mesh Overlay**, **Obstacle Envelope Surface**, **Safe Flight Ceiling Surface**, **3D Wireframe Grid**, **AGL/MSL** mode, buffer/opacity sliders, and **Plan Flight Corridor** (`activeTool: 'drone-corridor'`).
+  - **Live MapLibre WebGL2 Overlay (`src/utils/maplibreDroneMeshLayer.ts`)**: `MapLibreDroneMeshLayer` (`CustomLayerInterface`, `renderingMode: '3d'`) attaches on `style.load`, uses `Uint32Array` index batches and dedicated VAOs with `Float32Array` projection uniforms (`projectTileFor3D`) for **3D Globe** and **Mercator** projections, and renders 3D extruded building safety-buffer prisms, 3D perimeter airspace curtains, the composite obstacle envelope mesh (with positive anti-occlusion elevation bias), the safe flight ceiling canopy, and elevated 3D flight corridor paths (`Teal` Safe, `Amber` Caution `<15m`, `Rose` Breach `<0m`).
+  - **Dedicated Three.js 3D Airspace Mesh Inspector (`src/components/DroneMeshInspector.tsx`)**: Interactive Three.js scene with `RoomEnvironment` IBL, 3-point studio lighting, calibrated vertical airspace relief scaling, terrain skirt specimen, extruded Overture buildings, translucent obstacle envelope + wireframe, translucent flight ceiling + wireframe, AOI corner boundary pillars, 3D flight corridor tube & waypoint pylons, throttled raycaster cursor inspection, software-WebGL frame pacing, and a collapsible bottom control dock.
+
 ---
 
 ## 3. System Architecture
@@ -70,13 +80,14 @@
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                         Browser Client (React 19 + Vite)                     │
 │                                                                              │
-│  TopBar (Presets & Snapshot)                                                 │
+│  TopBar (Presets · Opt-In 3D Drone Mesh Toggle · 3D Inspector · Snapshot)     │
 │  ├── ControlSidebar (Geocode Search · Projection · 1° Graticule · DEM Modes  │
 │  │                   Solar Azimuth · Overture Layers · Profile · 3D Distance │
-│  │                   Viewport Δh Discrepancy Grid)                           │
+│  │                   Viewport Δh Discrepancy · Opt-In Drone 3D Mesh Controls)│
 │  ├── MapViewport (MapLibre GL JS 3D Globe/Terrain · PMTiles · dem-analysis://│
-│  │                geodesic.ts · Draggable 3D Compass · Orbit/Rotate Controls │
-│  │                1° Graticule · Geodesic/3D Distance HUD · Telemetry HUD)   │
+│  │                MapLibreDroneMeshLayer · Drone Corridor GeoJSON & HUD      │
+│  │                geodesic.ts · Draggable 3D Compass · Orbit/Rotate Controls)│
+│  ├── DroneMeshInspector (Three.js 3D Terrain/Building/Envelope/Ceiling View) │
 │  ├── FeatureInspector (Overture GERS ID · Schema Attributes · Provenance)    │
 │  └── TelemetryTray (SRTM vs ASTER SVG Profile · Δh Histogram · CSV Export)   │
 └───────────────────────────────────────┬──────────────────────────────────────┘
@@ -100,8 +111,10 @@
 - **Core State Types (`src/types/geospatial.ts`)**:
   - `TerrainMode`: `'hypsometric' | 'slope' | 'aspect' | 'natural'`
   - `ElevationRampPreset`: `'scientific-terrain' | 'alpine-monochrome' | 'high-contrast'`
-  - `ActiveTool`: `'inspect' | 'profile-draw' | 'measure-distance'`
+  - `ActiveTool`: `'inspect' | 'profile-draw' | 'measure-distance' | 'drone-corridor'`
   - `ProjectionMode`: `'globe' | 'mercator'`
+  - `DroneZoneConfig`: `{ enabled, showMapOverlay, showInspectorModal, showEnvelopeMesh, showCeilingMesh, showWireframe, altitudeMode: 'agl' | 'msl', ceilingMeters, verticalBufferMeters, horizontalBufferMeters, envelopeOpacity, ceilingOpacity }`
+  - `DroneAirspaceGrid` & `DroneCorridorAnalysis`: `52×52` bilinear Float32Array terrain/envelope/ceiling/clearance matrices and waypoint segment clearance telemetry
   - `DistanceMeasurementResult`: `{ pointA, pointB, geodesicMeters, initialBearingDeg, surfaceSrtmMeters, surfaceAsterMeters, elevASrtm, elevBSrtm, elevAAster, elevBAster, ascentSrtmMeters, descentSrtmMeters, maxGradePct, sampleCount, loading, error }`
 - **Theme**: Clean minimalist scientific explorer (`#F8FAFC` / `#FFFFFF` clinical canvas, `#E2E8F0` `1px` hairline borders, `#0F172A` slate ink).
 - **Accents**: Cobalt `#2563EB` (primary actions, NASA SRTM series, North needle, Equator/PM), Amber `#D97706` (ASTER GDEM series, solar controls), Cyan `#0891B2` (Overture structures & 3D distance arc).

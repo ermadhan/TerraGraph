@@ -14,6 +14,8 @@ import {
   Orbit,
   MoveHorizontal,
   X,
+  ShieldAlert,
+  Box as BoxIcon,
 } from 'lucide-react';
 import {
   registerDemAnalysisProtocol,
@@ -21,12 +23,17 @@ import {
   sampleTerrariumPoint,
 } from '../utils/demProtocol';
 import { formatDistance, sampleGreatCircle } from '../utils/geodesic';
+import { MapLibreDroneMeshLayer } from '../utils/maplibreDroneMeshLayer';
 import type {
   ActiveTool,
   BuildingColorMode,
   CursorTelemetry,
   DiscrepancyGridResult,
   DistanceMeasurementResult,
+  DroneAirspaceGrid,
+  DroneBuildingFootprint,
+  DroneCorridorAnalysis,
+  DroneZoneConfig,
   ElevationRampPreset,
   OvertureConfig,
   OvertureLayerVisibility,
@@ -181,6 +188,12 @@ export interface MapViewportHandle {
   flyTo: (center: [number, number], zoom: number, pitch?: number, bearing?: number) => void;
   getBoundsBbox: () => [number, number, number, number] | null;
   captureSnapshot: () => string | null;
+  extractAirspaceSnapshot: () => {
+    center: [number, number];
+    bbox: [number, number, number, number];
+    zoom: number;
+    buildings: DroneBuildingFootprint[];
+  } | null;
 }
 
 interface MapViewportProps {
@@ -214,6 +227,17 @@ interface MapViewportProps {
   selectedFeatureId: string | null;
   onSelectFeature: (feature: SelectedOvertureFeature | null) => void;
   onResetCurrentRegion: () => void;
+  droneConfig: DroneZoneConfig;
+  droneGrid: DroneAirspaceGrid | null;
+  droneGridLoading: boolean;
+  droneWaypoints: Array<[number, number]>;
+  droneCorridorAnalysis: DroneCorridorAnalysis | null;
+  onAddDroneWaypoint: (coord: [number, number]) => void;
+  onClearDroneCorridor: () => void;
+  onToggleDroneEnabled: () => void;
+  onOpenDroneInspector: () => void;
+  onResampleDroneAoi: () => void;
+  onAutoCaptureDroneBuildings: () => void;
 }
 
 export const MapViewport: React.FC<MapViewportProps> = ({
@@ -247,12 +271,26 @@ export const MapViewport: React.FC<MapViewportProps> = ({
   selectedFeatureId,
   onSelectFeature,
   onResetCurrentRegion,
+  droneConfig,
+  droneGrid,
+  droneGridLoading,
+  droneWaypoints,
+  droneCorridorAnalysis,
+  onAddDroneWaypoint,
+  onClearDroneCorridor,
+  onToggleDroneEnabled,
+  onOpenDroneInspector,
+  onResampleDroneAoi,
+  onAutoCaptureDroneBuildings,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
+  const droneLayerRef = useRef<MapLibreDroneMeshLayer | null>(null);
   const [mapReady, setMapReady] = useState(false);
+  const [droneLayerError, setDroneLayerError] = useState<string | null>(null);
   const [dragMode, setDragMode] = useState<'pan' | 'orbit'>('pan');
   const [measurePreviewCoord, setMeasurePreviewCoord] = useState<[number, number] | null>(null);
+  const [corridorPreviewCoord, setCorridorPreviewCoord] = useState<[number, number] | null>(null);
   const [cameraOrientation, setCameraOrientation] = useState<{ bearing: number; pitch: number }>({
     bearing: initialBearing,
     pitch: initialPitch,
@@ -297,8 +335,14 @@ export const MapViewport: React.FC<MapViewportProps> = ({
   onAddDistancePointRef.current = onAddDistancePoint;
   const distancePointsLengthRef = useRef(distancePoints.length);
   distancePointsLengthRef.current = distancePoints.length;
+  const onAddDroneWaypointRef = useRef(onAddDroneWaypoint);
+  onAddDroneWaypointRef.current = onAddDroneWaypoint;
+  const droneWaypointsLengthRef = useRef(droneWaypoints.length);
+  droneWaypointsLengthRef.current = droneWaypoints.length;
   const onSelectFeatureRef = useRef(onSelectFeature);
   onSelectFeatureRef.current = onSelectFeature;
+  const droneAutoCaptureRef = useRef(onAutoCaptureDroneBuildings);
+  droneAutoCaptureRef.current = onAutoCaptureDroneBuildings;
 
   const sampleTimerRef = useRef<number | null>(null);
   const appliedExaggerationRef = useRef<number>(exaggeration);
@@ -371,6 +415,10 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           data: getOneDegreeGraticuleGeoJSON(),
         },
         'distance-measure-geo': {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        },
+        'drone-corridor-geo': {
           type: 'geojson',
           data: { type: 'FeatureCollection', features: [] },
         },
@@ -671,6 +719,42 @@ export const MapViewport: React.FC<MapViewportProps> = ({
             'circle-stroke-color': '#FFFFFF',
           },
         },
+        {
+          id: 'drone-corridor-line',
+          type: 'line',
+          source: 'drone-corridor-geo',
+          filter: ['==', ['geometry-type'], 'LineString'],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round',
+          },
+          paint: {
+            'line-color': [
+              'match',
+              ['get', 'status'],
+              'VIOLATION',
+              '#E11D48',
+              'CAUTION',
+              '#D97706',
+              'CLEAR',
+              '#059669',
+              '#0891B2',
+            ],
+            'line-width': 3.5,
+          },
+        },
+        {
+          id: 'drone-corridor-points',
+          type: 'circle',
+          source: 'drone-corridor-geo',
+          filter: ['==', ['geometry-type'], 'Point'],
+          paint: {
+            'circle-radius': 5.5,
+            'circle-color': '#0F172A',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#FFFFFF',
+          },
+        },
       ],
     };
 
@@ -753,10 +837,36 @@ export const MapViewport: React.FC<MapViewportProps> = ({
       setGraticuleLabels(labels);
     };
 
+    let styleInitialized = false;
+    const ensureDroneLayerAttached = () => {
+      if (!droneLayerRef.current) {
+        droneLayerRef.current = new MapLibreDroneMeshLayer((err) => setDroneLayerError(err));
+      }
+      const droneLayer = droneLayerRef.current;
+      if (!map.getLayer(droneLayer.id)) {
+        map.addLayer(droneLayer);
+      }
+      if (!styleInitialized) {
+        styleInitialized = true;
+        setMapReady(true);
+        setCameraOrientation({ bearing: map.getBearing(), pitch: map.getPitch() });
+        computeGraticuleEdgeLabels();
+      }
+    };
+
+    map.on('style.load', ensureDroneLayerAttached);
+    if (map.isStyleLoaded()) {
+      ensureDroneLayerAttached();
+    }
+
     map.on('load', () => {
-      setMapReady(true);
-      setCameraOrientation({ bearing: map.getBearing(), pitch: map.getPitch() });
+      ensureDroneLayerAttached();
       computeGraticuleEdgeLabels();
+      droneAutoCaptureRef.current();
+    });
+
+    map.on('idle', () => {
+      droneAutoCaptureRef.current();
     });
 
     map.on('move', () => {
@@ -777,6 +887,12 @@ export const MapViewport: React.FC<MapViewportProps> = ({
         setMeasurePreviewCoord([lng, lat]);
       } else {
         setMeasurePreviewCoord(null);
+      }
+
+      if (activeToolRef.current === 'drone-corridor' && droneWaypointsLengthRef.current >= 1) {
+        setCorridorPreviewCoord([lng, lat]);
+      } else {
+        setCorridorPreviewCoord(null);
       }
 
       // Check discrepancy grid point hover only if layer exists in style
@@ -826,6 +942,11 @@ export const MapViewport: React.FC<MapViewportProps> = ({
       if (activeToolRef.current === 'measure-distance') {
         setMeasurePreviewCoord(null);
         onAddDistancePointRef.current([e.lngLat.lng, e.lngLat.lat]);
+        return;
+      }
+      if (activeToolRef.current === 'drone-corridor') {
+        setCorridorPreviewCoord(null);
+        onAddDroneWaypointRef.current([e.lngLat.lng, e.lngLat.lat]);
         return;
       }
 
@@ -899,10 +1020,93 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           return null;
         }
       },
+      extractAirspaceSnapshot: () => {
+        const b = map.getBounds();
+        if (!b) return null;
+        const c = map.getCenter();
+        const center: [number, number] = [c.lng, c.lat];
+        const bbox: [number, number, number, number] = [
+          b.getWest(),
+          b.getSouth(),
+          b.getEast(),
+          b.getNorth(),
+        ];
+        const zoom = map.getZoom();
+
+        const queryLayers = ['overture-buildings-3d', 'overture-building-parts-3d'].filter((id) =>
+          Boolean(map.getLayer(id)),
+        );
+        const buildings: DroneBuildingFootprint[] = [];
+        const seen = new Set<string>();
+
+        if (queryLayers.length > 0) {
+          const features = map.queryRenderedFeatures({ layers: queryLayers });
+          for (const f of features) {
+            const props = (f.properties || {}) as Record<string, unknown>;
+            const rawHeight =
+              typeof props.height === 'number'
+                ? props.height
+                : typeof props.num_floors === 'number'
+                  ? props.num_floors * 3.5
+                  : 7;
+            const heightMeters = Math.max(2, Number.isFinite(rawHeight) ? rawHeight : 7);
+            const minHeightMeters =
+              typeof props.min_height === 'number' && Number.isFinite(props.min_height)
+                ? props.min_height
+                : 0;
+
+            const geom = f.geometry;
+            const extractRing = (ringCoords: unknown): Array<[number, number]> => {
+              if (!Array.isArray(ringCoords)) return [];
+              const pts: Array<[number, number]> = [];
+              for (const pt of ringCoords) {
+                if (Array.isArray(pt) && pt.length >= 2) {
+                  const lon = Number(pt[0]);
+                  const lat = Number(pt[1]);
+                  if (Number.isFinite(lon) && Number.isFinite(lat)) {
+                    pts.push([lon, lat]);
+                  }
+                }
+              }
+              return pts;
+            };
+
+            const polygons: Array<Array<[number, number]>> = [];
+            if (geom.type === 'Polygon' && Array.isArray(geom.coordinates[0])) {
+              polygons.push(extractRing(geom.coordinates[0]));
+            } else if (geom.type === 'MultiPolygon') {
+              for (const poly of geom.coordinates) {
+                if (Array.isArray(poly[0])) {
+                  polygons.push(extractRing(poly[0]));
+                }
+              }
+            }
+
+            polygons.forEach((ring, polyIdx) => {
+              if (ring.length < 3) return;
+              const cLon = ring[0][0].toFixed(5);
+              const cLat = ring[0][1].toFixed(5);
+              const dedupKey = `${String(props.id || f.id || '')}-${cLon}-${cLat}-${polyIdx}`;
+              if (seen.has(dedupKey)) return;
+              seen.add(dedupKey);
+              buildings.push({
+                id: dedupKey,
+                title: extractFeatureTitle(props, 'Overture Building'),
+                heightMeters,
+                minHeightMeters,
+                ring,
+              });
+            });
+          }
+        }
+
+        return { center, bbox, zoom, buildings };
+      },
     };
 
     return () => {
       if (sampleTimerRef.current !== null) window.clearTimeout(sampleTimerRef.current);
+      droneLayerRef.current = null;
       mapHandleRef.current = null;
       map.remove();
       mapRef.current = null;
@@ -914,7 +1118,12 @@ export const MapViewport: React.FC<MapViewportProps> = ({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    if (dragMode === 'orbit' && activeTool !== 'profile-draw' && activeTool !== 'measure-distance') {
+    if (
+      dragMode === 'orbit' &&
+      activeTool !== 'profile-draw' &&
+      activeTool !== 'measure-distance' &&
+      activeTool !== 'drone-corridor'
+    ) {
       map.dragPan.disable();
     } else {
       map.dragPan.enable();
@@ -1216,13 +1425,100 @@ export const MapViewport: React.FC<MapViewportProps> = ({
     });
   }, [discrepancyGrid, discrepancyOpacity, mapReady]);
 
+  // Sync Drone 3D Mesh WebGL Custom Layer with opt-in config, grid, exaggeration & corridor
+  useEffect(() => {
+    const map = mapRef.current;
+    const layer = droneLayerRef.current;
+    if (!map || !layer || !mapReady) return;
+    if (!map.getLayer(layer.id)) {
+      map.addLayer(layer);
+    }
+    layer.updateData(droneGrid, droneConfig, exaggeration, droneCorridorAnalysis);
+    map.triggerRepaint();
+  }, [droneGrid, droneConfig, exaggeration, droneCorridorAnalysis, mapReady]);
+
+  // Sync Drone Flight Corridor GeoJSON overlay
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const src = map.getSource('drone-corridor-geo') as GeoJSONSource | undefined;
+    if (!src) return;
+
+    if (!droneConfig.enabled || droneWaypoints.length === 0) {
+      src.setData({ type: 'FeatureCollection', features: [] });
+      return;
+    }
+
+    const features: Array<{
+      type: 'Feature';
+      properties: Record<string, unknown>;
+      geometry:
+        | { type: 'Point'; coordinates: [number, number] }
+        | { type: 'LineString'; coordinates: Array<[number, number]> };
+    }> = droneWaypoints.map((pt, idx) => ({
+      type: 'Feature',
+      properties: { label: `WP${idx + 1}` },
+      geometry: { type: 'Point', coordinates: pt },
+    }));
+
+    if (droneCorridorAnalysis && droneCorridorAnalysis.samples.length >= 2) {
+      for (let i = 1; i < droneCorridorAnalysis.samples.length; i++) {
+        const a = droneCorridorAnalysis.samples[i - 1];
+        const b = droneCorridorAnalysis.samples[i];
+        const worstStatus =
+          a.status === 'VIOLATION' || b.status === 'VIOLATION'
+            ? 'VIOLATION'
+            : a.status === 'CAUTION' || b.status === 'CAUTION'
+              ? 'CAUTION'
+              : 'CLEAR';
+        features.push({
+          type: 'Feature',
+          properties: { status: worstStatus },
+          geometry: {
+            type: 'LineString',
+            coordinates: [
+              [a.lon, a.lat],
+              [b.lon, b.lat],
+            ],
+          },
+        });
+      }
+    } else if (droneWaypoints.length >= 2) {
+      features.push({
+        type: 'Feature',
+        properties: { status: 'PREVIEW' },
+        geometry: { type: 'LineString', coordinates: droneWaypoints },
+      });
+    }
+
+    if (activeTool === 'drone-corridor' && corridorPreviewCoord && droneWaypoints.length >= 1) {
+      features.push({
+        type: 'Feature',
+        properties: { status: 'PREVIEW' },
+        geometry: {
+          type: 'LineString',
+          coordinates: [droneWaypoints[droneWaypoints.length - 1], corridorPreviewCoord],
+        },
+      });
+    }
+
+    src.setData({ type: 'FeatureCollection', features });
+  }, [droneConfig.enabled, droneWaypoints, droneCorridorAnalysis, activeTool, corridorPreviewCoord, mapReady]);
+
   return (
     <div
       className="relative flex-1 h-full min-w-0 bg-[#E2E8F0]"
       onContextMenu={(e) => e.preventDefault()}
       onPointerDownCapture={(e) => {
         const map = mapRef.current;
-        if (!map || activeTool === 'profile-draw' || activeTool === 'measure-distance') return;
+        if (
+          !map ||
+          activeTool === 'profile-draw' ||
+          activeTool === 'measure-distance' ||
+          activeTool === 'drone-corridor'
+        ) {
+          return;
+        }
         // Left-drag in Orbit mode, or Shift/Alt + Left-drag in Pan mode
         const wantsOrbit =
           e.button === 0 && (dragModeRef.current === 'orbit' || e.shiftKey || e.altKey);
@@ -1290,7 +1586,9 @@ export const MapViewport: React.FC<MapViewportProps> = ({
       <div
         ref={containerRef}
         className={`w-full h-full ${
-          activeTool === 'profile-draw' || activeTool === 'measure-distance'
+          activeTool === 'profile-draw' ||
+          activeTool === 'measure-distance' ||
+          activeTool === 'drone-corridor'
             ? 'cursor-crosshair'
             : dragMode === 'orbit'
               ? 'cursor-grab active:cursor-grabbing'
@@ -1545,6 +1843,22 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           </button>
           <button
             type="button"
+            onClick={onToggleDroneEnabled}
+            title={
+              droneConfig.enabled
+                ? 'Disable Drone 3D Flight Zone Mesh'
+                : 'Enable Opt-In Drone 3D Flight Zone Mesh'
+            }
+            className={`w-8 h-8 flex items-center justify-center transition-colors cursor-pointer ${
+              droneConfig.enabled
+                ? 'bg-cyan-700 text-white hover:bg-cyan-800'
+                : 'text-slate-700 hover:bg-slate-100'
+            }`}
+          >
+            <ShieldAlert className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
             onClick={onResetCurrentRegion}
             title="Reset Region View"
             className="w-8 h-8 flex items-center justify-center text-slate-700 hover:bg-slate-100 cursor-pointer text-[10px] font-mono font-semibold"
@@ -1553,6 +1867,141 @@ export const MapViewport: React.FC<MapViewportProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Floating Opt-In Drone Airspace Clearance HUD */}
+      {droneConfig.enabled && (
+        <div
+          className={`absolute ${distancePoints.length > 0 ? 'top-3 left-28' : 'bottom-12 left-3'} bg-white/95 border border-slate-200 rounded-md px-3.5 py-2.5 shadow-xs z-20 min-w-[285px] max-w-[350px]`}
+        >
+          <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100">
+            <span className="text-[11px] font-semibold text-slate-800 flex items-center gap-1.5">
+              <ShieldAlert className="w-3.5 h-3.5 text-cyan-700" />
+              Drone Flight Zone Mesh
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={onOpenDroneInspector}
+                className="px-2 py-0.5 text-[10px] font-medium bg-slate-900 text-white rounded hover:bg-slate-800 flex items-center gap-1 cursor-pointer"
+              >
+                <BoxIcon className="w-3 h-3" />
+                3D Inspector
+              </button>
+              <button
+                type="button"
+                onClick={onToggleDroneEnabled}
+                title="Disable Drone Mesh"
+                className="text-slate-400 hover:text-slate-700 p-0.5 rounded cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {droneGridLoading && !droneGrid ? (
+            <div className="pt-2 text-[11px] font-mono text-slate-500">
+              Synthesizing terrain + Overture obstacle mesh...
+            </div>
+          ) : droneGrid ? (
+            <div className="pt-2 space-y-1.5 text-[11px] font-mono tabular-nums">
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <div className="text-[9px] uppercase tracking-wider text-slate-400">Ceiling</div>
+                  <div className="font-semibold text-slate-900">
+                    {droneConfig.ceilingMeters}m {droneConfig.altitudeMode.toUpperCase()}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] uppercase tracking-wider text-slate-400">Min Clear</div>
+                  <div
+                    className={`font-semibold ${
+                      droneGrid.minClearanceMeters < 0
+                        ? 'text-rose-600'
+                        : droneGrid.minClearanceMeters < 15
+                          ? 'text-amber-600'
+                          : 'text-emerald-700'
+                    }`}
+                  >
+                    {droneGrid.minClearanceMeters > 0
+                      ? `+${droneGrid.minClearanceMeters}`
+                      : droneGrid.minClearanceMeters}
+                    m
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] uppercase tracking-wider text-slate-400">Breach</div>
+                  <div
+                    className={`font-semibold ${
+                      droneGrid.violationPct > 0 ? 'text-rose-600' : 'text-slate-900'
+                    }`}
+                  >
+                    {droneGrid.violationPct}%
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between text-[10px] text-slate-500 pt-1 border-t border-slate-100">
+                <span>
+                  V-Buf +{droneConfig.verticalBufferMeters}m · H-Buf +
+                  {droneConfig.horizontalBufferMeters}m
+                </span>
+                <span>
+                  {droneGrid.buildingCount} bldgs · {droneGrid.demTilesLoaded} DEM
+                </span>
+              </div>
+
+              {droneLayerError && (
+                <div className="pt-1 text-[10px] text-rose-600 font-mono break-words">
+                  WebGL shader error: {droneLayerError}
+                </div>
+              )}
+
+              {droneCorridorAnalysis && (
+                <div className="pt-1 border-t border-slate-100 flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-slate-600">
+                    Corridor ({formatDistance(droneCorridorAnalysis.summary.totalLengthMeters)})
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={`px-1.5 py-0.5 text-[10px] font-semibold rounded border ${
+                        droneCorridorAnalysis.summary.status === 'VIOLATION'
+                          ? 'bg-rose-50 text-rose-700 border-rose-200'
+                          : droneCorridorAnalysis.summary.status === 'CAUTION'
+                            ? 'bg-amber-50 text-amber-700 border-amber-200'
+                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      }`}
+                    >
+                      {droneCorridorAnalysis.summary.status}{' '}
+                      {droneCorridorAnalysis.summary.minClearanceMeters > 0
+                        ? `+${droneCorridorAnalysis.summary.minClearanceMeters}`
+                        : droneCorridorAnalysis.summary.minClearanceMeters}
+                      m
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onClearDroneCorridor}
+                      className="text-[10px] text-slate-400 hover:text-slate-700 underline cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="pt-2 flex items-center justify-between gap-2 text-[11px] font-mono text-slate-500">
+              <span>Ready to sample AOI.</span>
+              <button
+                type="button"
+                onClick={onResampleDroneAoi}
+                className="px-2 py-0.5 text-[10px] font-medium bg-cyan-50 text-cyan-800 border border-cyan-200 rounded hover:bg-cyan-100 cursor-pointer"
+              >
+                Sample AOI
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Floating Geodesic & Terrain 3D Distance Measurement HUD */}
       {distancePoints.length > 0 && (

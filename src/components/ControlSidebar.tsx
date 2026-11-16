@@ -11,11 +11,18 @@ import {
   X,
   Loader2,
   MoveHorizontal,
+  ShieldAlert,
+  Box,
+  RefreshCw,
+  Route,
 } from 'lucide-react';
 import type {
   ActiveTool,
   BuildingColorMode,
   DiscrepancyGridResult,
+  DroneAirspaceGrid,
+  DroneCorridorAnalysis,
+  DroneZoneConfig,
   ElevationRampPreset,
   GeocodeResult,
   OvertureConfig,
@@ -63,6 +70,15 @@ interface ControlSidebarProps {
   discrepancyOpacity: number;
   onChangeDiscrepancyOpacity: (val: number) => void;
   onClearDiscrepancy: () => void;
+  droneConfig: DroneZoneConfig;
+  onToggleDroneEnabled: () => void;
+  onUpdateDroneConfig: (updater: (prev: DroneZoneConfig) => DroneZoneConfig) => void;
+  droneGrid: DroneAirspaceGrid | null;
+  droneGridLoading: boolean;
+  onResampleDroneAoi: () => void;
+  droneWaypointsCount: number;
+  droneCorridorAnalysis: DroneCorridorAnalysis | null;
+  onClearDroneCorridor: () => void;
 }
 
 export const ControlSidebar: React.FC<ControlSidebarProps> = ({
@@ -104,6 +120,15 @@ export const ControlSidebar: React.FC<ControlSidebarProps> = ({
   discrepancyOpacity,
   onChangeDiscrepancyOpacity,
   onClearDiscrepancy,
+  droneConfig,
+  onToggleDroneEnabled,
+  onUpdateDroneConfig,
+  droneGrid,
+  droneGridLoading,
+  onResampleDroneAoi,
+  droneWaypointsCount,
+  droneCorridorAnalysis,
+  onClearDroneCorridor,
 }) => {
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
@@ -651,6 +676,363 @@ export const ControlSidebar: React.FC<ControlSidebarProps> = ({
               </p>
             )}
           </div>
+        </section>
+
+        {/* 6. Drone Flight Zones (3D Mesh — Strictly Opt-In) */}
+        <section className="p-4 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+              <ShieldAlert className="w-3.5 h-3.5 text-cyan-700" />
+              Drone Flight Zones (3D Mesh)
+            </h2>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={droneConfig.enabled}
+              onClick={onToggleDroneEnabled}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors cursor-pointer ${
+                droneConfig.enabled
+                  ? 'bg-cyan-700 border-cyan-700'
+                  : 'bg-slate-200 border-slate-300'
+              }`}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  droneConfig.enabled ? 'translate-x-4' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+          </div>
+
+          {!droneConfig.enabled ? (
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Toggle on to synthesize a composite 3D obstacle envelope (terrain + Overture buildings
+              + safety buffers) and safe flight ceiling mesh.
+            </p>
+          ) : (
+            <div className="space-y-3 pt-0.5">
+              {/* Primary Actions: Live Map Overlay, Three.js Inspector, Resample */}
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateDroneConfig((p) => ({ ...p, showInspectorModal: true }))
+                  }
+                  className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium bg-slate-900 text-white rounded-md hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+                >
+                  <Box className="w-3.5 h-3.5" />
+                  3D Mesh View
+                </button>
+                <button
+                  type="button"
+                  onClick={onResampleDroneAoi}
+                  disabled={droneGridLoading}
+                  className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium bg-[#F8FAFC] border border-slate-200 text-slate-800 rounded-md hover:bg-slate-100 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${droneGridLoading ? 'animate-spin' : ''}`} />
+                  {droneGridLoading ? 'Sampling...' : 'Resample AOI'}
+                </button>
+              </div>
+
+              {/* Opt-in Surface & Overlay Toggles */}
+              <div className="space-y-1.5 bg-[#F8FAFC] border border-slate-200 rounded-md p-2.5">
+                {(
+                  [
+                    ['showMapOverlay', 'Live Map 3D Mesh Overlay'],
+                    ['showEnvelopeMesh', 'Obstacle Envelope Surface'],
+                    ['showCeilingMesh', 'Safe Flight Ceiling Surface'],
+                    ['showWireframe', '3D Wireframe Grid'],
+                  ] as Array<[keyof DroneZoneConfig, string]>
+                ).map(([key, label]) => (
+                  <label
+                    key={key}
+                    className="flex items-center justify-between text-[11px] text-slate-700 cursor-pointer select-none"
+                  >
+                    <span>{label}</span>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(droneConfig[key])}
+                      onChange={() =>
+                        onUpdateDroneConfig((p) => ({ ...p, [key]: !p[key] }))
+                      }
+                      className="w-3.5 h-3.5 rounded border-slate-300 text-cyan-700 focus:ring-cyan-700 cursor-pointer"
+                    />
+                  </label>
+                ))}
+              </div>
+
+              {/* Altitude Reference (AGL / MSL) & Ceiling Slider */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-slate-600">Flight Ceiling</span>
+                  <div className="flex items-center gap-1.5">
+                    <div className="flex bg-slate-100 p-0.5 rounded">
+                      {(['agl', 'msl'] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() =>
+                            onUpdateDroneConfig((p) => {
+                              if (p.altitudeMode === mode) return p;
+                              const baseElev = Math.round(droneGrid?.minTerrainMeters ?? 0);
+                              const nextCeiling =
+                                mode === 'msl'
+                                  ? Math.min(4500, Math.max(40, p.ceilingMeters + baseElev))
+                                  : Math.min(500, Math.max(20, p.ceilingMeters - baseElev));
+                              return { ...p, altitudeMode: mode, ceilingMeters: nextCeiling };
+                            })
+                          }
+                          className={`px-1.5 py-0.5 text-[10px] font-mono font-semibold uppercase rounded cursor-pointer ${
+                            droneConfig.altitudeMode === mode
+                              ? 'bg-white text-slate-900 shadow-xs'
+                              : 'text-slate-500'
+                          }`}
+                        >
+                          {mode}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="font-mono tabular-nums text-[11px] font-semibold text-slate-900">
+                      {droneConfig.ceilingMeters}m
+                    </span>
+                  </div>
+                </div>
+                <input
+                  type="range"
+                  min={
+                    droneConfig.altitudeMode === 'agl'
+                      ? 20
+                      : Math.max(20, Math.floor(droneGrid?.minTerrainMeters ?? 0))
+                  }
+                  max={
+                    droneConfig.altitudeMode === 'agl'
+                      ? 500
+                      : Math.max(600, Math.ceil((droneGrid?.maxTerrainMeters ?? 500) + 500))
+                  }
+                  step={5}
+                  value={droneConfig.ceilingMeters}
+                  onChange={(e) =>
+                    onUpdateDroneConfig((p) => ({
+                      ...p,
+                      ceilingMeters: Number(e.target.value),
+                    }))
+                  }
+                  className="w-full sci-slider"
+                />
+                {droneConfig.altitudeMode === 'agl' && (
+                  <div className="grid grid-cols-4 gap-1">
+                    {[60, 120, 200, 350].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() =>
+                          onUpdateDroneConfig((p) => ({ ...p, ceilingMeters: preset }))
+                        }
+                        className={`py-0.5 text-[10px] font-mono rounded border cursor-pointer ${
+                          droneConfig.ceilingMeters === preset
+                            ? 'bg-cyan-50 border-cyan-200 text-cyan-800 font-medium'
+                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {preset}m
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Vertical & Horizontal Safety Buffers */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-600">Vert. Buffer</span>
+                    <span className="font-mono tabular-nums font-medium text-slate-900">
+                      {droneConfig.verticalBufferMeters}m
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={60}
+                    step={1}
+                    value={droneConfig.verticalBufferMeters}
+                    onChange={(e) =>
+                      onUpdateDroneConfig((p) => ({
+                        ...p,
+                        verticalBufferMeters: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full sci-slider"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-600">Horiz. Buffer</span>
+                    <span className="font-mono tabular-nums font-medium text-slate-900">
+                      {droneConfig.horizontalBufferMeters}m
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={50}
+                    step={1}
+                    value={droneConfig.horizontalBufferMeters}
+                    onChange={(e) =>
+                      onUpdateDroneConfig((p) => ({
+                        ...p,
+                        horizontalBufferMeters: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full sci-slider"
+                  />
+                </div>
+              </div>
+
+              {/* Mesh Opacity Sliders */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-600">Envelope α</span>
+                    <span className="font-mono tabular-nums text-slate-900">
+                      {Math.round(droneConfig.envelopeOpacity * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={0.9}
+                    step={0.05}
+                    value={droneConfig.envelopeOpacity}
+                    onChange={(e) =>
+                      onUpdateDroneConfig((p) => ({
+                        ...p,
+                        envelopeOpacity: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full sci-slider"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-600">Ceiling α</span>
+                    <span className="font-mono tabular-nums text-slate-900">
+                      {Math.round(droneConfig.ceilingOpacity * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={0.85}
+                    step={0.05}
+                    value={droneConfig.ceilingOpacity}
+                    onChange={(e) =>
+                      onUpdateDroneConfig((p) => ({
+                        ...p,
+                        ceilingOpacity: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full sci-slider"
+                  />
+                </div>
+              </div>
+
+              {/* Flight Corridor Planner Toggle */}
+              <div className="pt-1 border-t border-slate-100 space-y-2">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onSetActiveTool(
+                        activeTool === 'drone-corridor' ? 'inspect' : 'drone-corridor',
+                      )
+                    }
+                    className={`flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      activeTool === 'drone-corridor'
+                        ? 'bg-cyan-700 border-cyan-700 text-white'
+                        : 'bg-[#F8FAFC] border-slate-200 text-slate-800 hover:bg-slate-100'
+                    }`}
+                  >
+                    <Route className="w-3.5 h-3.5" />
+                    {activeTool === 'drone-corridor'
+                      ? `Drawing Corridor (${droneWaypointsCount} WPs)`
+                      : 'Plan Flight Corridor'}
+                  </button>
+                  {droneWaypointsCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={onClearDroneCorridor}
+                      className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 border border-slate-200 rounded-md hover:bg-slate-100 cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+
+                {activeTool === 'drone-corridor' && (
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    Click waypoints on the map to evaluate corridor clearance against terrain and
+                    building envelopes.
+                  </p>
+                )}
+
+                {/* AOI & Corridor Clearance Telemetry Readout */}
+                {droneGrid && (
+                  <div className="bg-[#F8FAFC] border border-slate-200 rounded-md p-2.5 space-y-1.5 text-[11px] font-mono tabular-nums">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">AOI Min Clearance</span>
+                      <span
+                        className={`font-semibold ${
+                          droneGrid.minClearanceMeters < 0
+                            ? 'text-rose-600'
+                            : droneGrid.minClearanceMeters < 15
+                              ? 'text-amber-600'
+                              : 'text-emerald-700'
+                        }`}
+                      >
+                        {droneGrid.minClearanceMeters > 0
+                          ? `+${droneGrid.minClearanceMeters}`
+                          : droneGrid.minClearanceMeters}
+                        m
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">AOI Breach Cells</span>
+                      <span
+                        className={`font-semibold ${
+                          droneGrid.violationPct > 0 ? 'text-rose-600' : 'text-slate-900'
+                        }`}
+                      >
+                        {droneGrid.violationPct}% ({droneGrid.buildingCount} bldgs)
+                      </span>
+                    </div>
+                    {droneCorridorAnalysis && (
+                      <div className="pt-1 border-t border-slate-200 flex justify-between items-center">
+                        <span className="text-slate-600">
+                          Corridor ({droneCorridorAnalysis.waypoints.length} WPs)
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 text-[10px] font-semibold rounded border ${
+                            droneCorridorAnalysis.summary.status === 'VIOLATION'
+                              ? 'bg-rose-50 text-rose-700 border-rose-200'
+                              : droneCorridorAnalysis.summary.status === 'CAUTION'
+                                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          }`}
+                        >
+                          {droneCorridorAnalysis.summary.status} ·{' '}
+                          {droneCorridorAnalysis.summary.minClearanceMeters > 0
+                            ? `+${droneCorridorAnalysis.summary.minClearanceMeters}`
+                            : droneCorridorAnalysis.summary.minClearanceMeters}
+                          m
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </section>
       </div>
     </aside>

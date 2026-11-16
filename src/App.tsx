@@ -5,13 +5,22 @@ import { MapViewport } from './components/MapViewport';
 import type { MapViewportHandle } from './components/MapViewport';
 import { FeatureInspector } from './components/FeatureInspector';
 import { TelemetryTray } from './components/TelemetryTray';
+import { DroneMeshInspector } from './components/DroneMeshInspector';
 import { REGION_PRESETS } from './types/geospatial';
 import { vincentyInverse } from './utils/geodesic';
+import {
+  DEFAULT_DRONE_ZONE_CONFIG,
+  analyzeDroneCorridor,
+  buildDroneAirspaceGrid,
+  recomputeDroneClearance,
+} from './utils/droneAirspace';
 import type {
   ActiveTool,
   BuildingColorMode,
   DiscrepancyGridResult,
   DistanceMeasurementResult,
+  DroneAirspaceGrid,
+  DroneZoneConfig,
   ElevationProfileResult,
   ElevationRampPreset,
   OvertureConfig,
@@ -78,6 +87,16 @@ export default function App() {
   const [activeTrayTab, setActiveTrayTab] = useState<'profile' | 'discrepancy'>('profile');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  const [droneConfig, setDroneConfig] = useState<DroneZoneConfig>(DEFAULT_DRONE_ZONE_CONFIG);
+  const [droneGrid, setDroneGrid] = useState<DroneAirspaceGrid | null>(null);
+  const [droneGridLoading, setDroneGridLoading] = useState(false);
+  const [droneWaypoints, setDroneWaypoints] = useState<Array<[number, number]>>([]);
+
+  const droneCorridorAnalysis = React.useMemo(
+    () => analyzeDroneCorridor(droneWaypoints, droneGrid, droneConfig),
+    [droneWaypoints, droneGrid, droneConfig],
+  );
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -105,6 +124,37 @@ export default function App() {
     }, 2600);
   };
 
+  const droneConfigRef = useRef(droneConfig);
+  droneConfigRef.current = droneConfig;
+  const droneGridRef = useRef(droneGrid);
+  droneGridRef.current = droneGrid;
+  const droneGridLoadingRef = useRef(droneGridLoading);
+  droneGridLoadingRef.current = droneGridLoading;
+  const droneAutoRetryAtRef = useRef<number>(0);
+  const droneResampleTimerRef = useRef<number | null>(null);
+
+  const scheduleDroneResampleAfterFly = () => {
+    if (droneResampleTimerRef.current !== null) {
+      window.clearTimeout(droneResampleTimerRef.current);
+      droneResampleTimerRef.current = null;
+    }
+    if (!droneConfigRef.current.enabled) return;
+    droneResampleTimerRef.current = window.setTimeout(() => {
+      droneResampleTimerRef.current = null;
+      if (droneConfigRef.current.enabled) {
+        void handleResampleDroneAoi(droneConfigRef.current);
+      }
+    }, 1650);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (droneResampleTimerRef.current !== null) {
+        window.clearTimeout(droneResampleTimerRef.current);
+      }
+    };
+  }, []);
+
   const handleSelectPreset = (preset: RegionPreset) => {
     setActivePreset(preset);
     setSelectedFeature(null);
@@ -114,8 +164,11 @@ export default function App() {
     setDistancePoints([]);
     setDistanceResult(null);
     setDiscrepancyGrid(null);
+    setDroneGrid(null);
+    setDroneWaypoints([]);
     setActiveTool('inspect');
     mapHandleRef.current?.flyTo(preset.center, preset.zoom, preset.pitch, preset.bearing);
+    scheduleDroneResampleAfterFly();
   };
 
   const handleFlyToLocation = (lon: number, lat: number, label: string) => {
@@ -126,8 +179,11 @@ export default function App() {
     setDistancePoints([]);
     setDistanceResult(null);
     setDiscrepancyGrid(null);
+    setDroneGrid(null);
+    setDroneWaypoints([]);
     setActiveTool('inspect');
     mapHandleRef.current?.flyTo([lon, lat], 13.4, 56, -20);
+    scheduleDroneResampleAfterFly();
     showToast(`Navigated to ${label}`);
   };
 
@@ -322,6 +378,97 @@ export default function App() {
     setDiscrepancyGrid(null);
   };
 
+  const handleResampleDroneAoi = async (overrideConfig?: DroneZoneConfig) => {
+    const snap = mapHandleRef.current?.extractAirspaceSnapshot();
+    if (!snap) {
+      showToast('Map viewport not ready for AOI sampling');
+      return;
+    }
+    setDroneGridLoading(true);
+    try {
+      const nextGrid = await buildDroneAirspaceGrid(
+        snap.bbox,
+        snap.zoom,
+        snap.buildings,
+        overrideConfig || droneConfigRef.current,
+        52,
+        52,
+        snap.center,
+      );
+      setDroneGrid(nextGrid);
+    } catch {
+      showToast('Failed to sample DEM / Overture AOI mesh');
+    } finally {
+      setDroneGridLoading(false);
+    }
+  };
+
+  const handleAutoCaptureDroneBuildings = () => {
+    if (!droneConfigRef.current.enabled || droneGridLoadingRef.current) return;
+    const curr = droneGridRef.current;
+    if (curr && curr.buildingCount > 0) return;
+    const now = Date.now();
+    if (now - droneAutoRetryAtRef.current < 2200) return;
+    const snap = mapHandleRef.current?.extractAirspaceSnapshot();
+    if (!snap) return;
+    if (!curr || snap.buildings.length > 0) {
+      droneAutoRetryAtRef.current = now;
+      void handleResampleDroneAoi(droneConfigRef.current);
+    }
+  };
+
+  const handleToggleDroneEnabled = () => {
+    const nextEnabled = !droneConfig.enabled;
+    const nextCfg: DroneZoneConfig = {
+      ...droneConfig,
+      enabled: nextEnabled,
+      showMapOverlay: nextEnabled ? true : droneConfig.showMapOverlay,
+      showInspectorModal: nextEnabled ? droneConfig.showInspectorModal : false,
+    };
+    setDroneConfig(nextCfg);
+    if (!nextEnabled) {
+      if (activeTool === 'drone-corridor') setActiveTool('inspect');
+      return;
+    }
+    if (!droneGrid) {
+      void handleResampleDroneAoi(nextCfg);
+    }
+  };
+
+  const handleUpdateDroneConfig = (updater: (prev: DroneZoneConfig) => DroneZoneConfig) => {
+    setDroneConfig((prev) => {
+      const next = updater(prev);
+      const needsFootprintRecompute =
+        next.horizontalBufferMeters !== prev.horizontalBufferMeters;
+      const needsClearanceRecompute =
+        needsFootprintRecompute ||
+        next.verticalBufferMeters !== prev.verticalBufferMeters ||
+        next.ceilingMeters !== prev.ceilingMeters ||
+        next.altitudeMode !== prev.altitudeMode;
+
+      if (needsClearanceRecompute) {
+        setDroneGrid((curr) =>
+          curr ? recomputeDroneClearance(curr, next, needsFootprintRecompute) : curr,
+        );
+      }
+      return next;
+    });
+  };
+
+  const handleAddDroneWaypoint = (coord: [number, number]) => {
+    setDroneWaypoints((prev) => [...prev, coord]);
+    if (!droneGrid && droneConfig.enabled) {
+      void handleResampleDroneAoi();
+    }
+  };
+
+  const handleClearDroneCorridor = () => {
+    setDroneWaypoints([]);
+    if (activeTool === 'drone-corridor') {
+      setActiveTool('inspect');
+    }
+  };
+
   const handleExportSnapshot = () => {
     const dataUrl = mapHandleRef.current?.captureSnapshot();
     if (!dataUrl) {
@@ -341,6 +488,12 @@ export default function App() {
         activePresetId={activePreset.id}
         onSelectPreset={handleSelectPreset}
         onExportSnapshot={handleExportSnapshot}
+        droneMeshEnabled={droneConfig.enabled}
+        onToggleDroneMesh={handleToggleDroneEnabled}
+        onOpenDroneInspector={() => {
+          handleUpdateDroneConfig((p) => ({ ...p, enabled: true, showInspectorModal: true }));
+          if (!droneGrid) void handleResampleDroneAoi();
+        }}
       />
 
       <div className="flex-1 min-h-0 flex overflow-hidden">
@@ -383,6 +536,15 @@ export default function App() {
           discrepancyOpacity={discrepancyOpacity}
           onChangeDiscrepancyOpacity={setDiscrepancyOpacity}
           onClearDiscrepancy={handleClearDiscrepancy}
+          droneConfig={droneConfig}
+          onToggleDroneEnabled={handleToggleDroneEnabled}
+          onUpdateDroneConfig={handleUpdateDroneConfig}
+          droneGrid={droneGrid}
+          droneGridLoading={droneGridLoading}
+          onResampleDroneAoi={() => void handleResampleDroneAoi()}
+          droneWaypointsCount={droneWaypoints.length}
+          droneCorridorAnalysis={droneCorridorAnalysis}
+          onClearDroneCorridor={handleClearDroneCorridor}
         />
 
         <div className="flex-1 min-w-0 flex flex-col overflow-hidden relative">
@@ -419,6 +581,20 @@ export default function App() {
                 selectedFeatureId={selectedFeature?.id || null}
                 onSelectFeature={setSelectedFeature}
                 onResetCurrentRegion={handleResetCurrentRegion}
+                droneConfig={droneConfig}
+                droneGrid={droneGrid}
+                droneGridLoading={droneGridLoading}
+                droneWaypoints={droneWaypoints}
+                droneCorridorAnalysis={droneCorridorAnalysis}
+                onAddDroneWaypoint={handleAddDroneWaypoint}
+                onClearDroneCorridor={handleClearDroneCorridor}
+                onToggleDroneEnabled={handleToggleDroneEnabled}
+                onOpenDroneInspector={() => {
+                  handleUpdateDroneConfig((p) => ({ ...p, enabled: true, showInspectorModal: true }));
+                  if (!droneGrid) void handleResampleDroneAoi();
+                }}
+                onResampleDroneAoi={() => void handleResampleDroneAoi()}
+                onAutoCaptureDroneBuildings={handleAutoCaptureDroneBuildings}
               />
             ) : (
               <div className="flex-1 flex items-center justify-center bg-[#F8FAFC] text-xs font-mono text-slate-500">
@@ -444,6 +620,19 @@ export default function App() {
           />
         </div>
       </div>
+
+      {droneConfig.enabled && droneConfig.showInspectorModal && (
+        <DroneMeshInspector
+          grid={droneGrid}
+          loading={droneGridLoading}
+          config={droneConfig}
+          exaggeration={exaggeration}
+          corridorAnalysis={droneCorridorAnalysis}
+          onChangeConfig={handleUpdateDroneConfig}
+          onResampleAoi={() => void handleResampleDroneAoi()}
+          onClose={() => handleUpdateDroneConfig((p) => ({ ...p, showInspectorModal: false }))}
+        />
+      )}
 
       {toastMessage && (
         <div className="fixed bottom-4 right-4 bg-slate-900 text-white text-xs px-3.5 py-2 rounded-md shadow-md z-50">
