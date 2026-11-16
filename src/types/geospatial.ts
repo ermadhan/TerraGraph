@@ -17,6 +17,7 @@ export interface DroneZoneConfig {
   showEnvelopeMesh: boolean;
   showCeilingMesh: boolean;
   showWireframe: boolean;
+  autoClimbCorridor: boolean;
   altitudeMode: DroneAltitudeMode;
   ceilingMeters: number;
   verticalBufferMeters: number;
@@ -70,6 +71,7 @@ export interface DroneCorridorSample {
   buildingHeightMeters: number;
   envelopeMeters: number;
   ceilingMeters: number;
+  safeFlightMeters: number;
   clearanceMeters: number;
   status: 'CLEAR' | 'CAUTION' | 'VIOLATION';
 }
@@ -81,6 +83,7 @@ export interface DroneCorridorAnalysis {
     totalLengthMeters: number;
     minClearanceMeters: number;
     maxEnvelopeMeters: number;
+    maxSafeFlightMeters: number;
     maxBuildingMeters: number;
     violationSampleCount: number;
     cautionSampleCount: number;

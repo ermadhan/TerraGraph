@@ -391,8 +391,8 @@ export default function App() {
         snap.zoom,
         snap.buildings,
         overrideConfig || droneConfigRef.current,
-        52,
-        52,
+        72,
+        72,
         snap.center,
       );
       setDroneGrid(nextGrid);

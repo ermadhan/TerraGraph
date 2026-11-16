@@ -1,8 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
+import * as maplibregl from 'maplibre-gl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
+  Box,
   ChevronDown,
   ChevronUp,
   Eye,
@@ -10,9 +12,11 @@ import {
   Layers,
   RefreshCw,
   RotateCcw,
+  Route,
   ShieldAlert,
   X,
 } from 'lucide-react';
+import { mapLibreOriginMetersToLngLat } from '../utils/droneAirspace';
 import type {
   DroneAirspaceGrid,
   DroneCorridorAnalysis,
@@ -34,6 +38,7 @@ interface HoverInspectTelemetry {
   lon: number;
   lat: number;
   terrainMeters: number;
+  rawBuildingMeters: number;
   buildingMeters: number;
   envelopeMeters: number;
   ceilingMeters: number;
@@ -69,6 +74,9 @@ function disposeObject3D(root: THREE.Object3D): void {
       mat.forEach((m) => m.dispose());
     } else if (mat) {
       mat.dispose();
+    }
+    if (obj instanceof THREE.InstancedMesh) {
+      obj.dispose();
     }
   });
 }
@@ -118,7 +126,38 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [dockCollapsed, setDockCollapsed] = useState(false);
+  const [showBlockedCells, setShowBlockedCells] = useState(true);
   const [hoverTelemetry, setHoverTelemetry] = useState<HoverInspectTelemetry | null>(null);
+
+  const blockedCellStats = React.useMemo(() => {
+    if (!grid) return { core: 0, buffer: 0, total: 0 };
+    const { cols, rows, rawBuildingHeight, bufferedBuildingHeight } = grid;
+    let core = 0;
+    let buffer = 0;
+    for (let r = 0; r < rows - 1; r++) {
+      for (let c = 0; c < cols - 1; c++) {
+        const i00 = r * cols + c;
+        const i10 = i00 + 1;
+        const i01 = (r + 1) * cols + c;
+        const i11 = i01 + 1;
+        const rawPeak = Math.max(
+          rawBuildingHeight[i00],
+          rawBuildingHeight[i10],
+          rawBuildingHeight[i01],
+          rawBuildingHeight[i11],
+        );
+        const bufPeak = Math.max(
+          bufferedBuildingHeight[i00],
+          bufferedBuildingHeight[i10],
+          bufferedBuildingHeight[i01],
+          bufferedBuildingHeight[i11],
+        );
+        if (rawPeak > 0.5) core++;
+        else if (bufPeak > 0.5) buffer++;
+      }
+    }
+    return { core, buffer, total: core + buffer };
+  }, [grid]);
 
   const gridRef = useRef(grid);
   gridRef.current = grid;
@@ -126,6 +165,9 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
   configRef.current = config;
   const exaggerationRef = useRef(exaggeration);
   exaggerationRef.current = exaggeration;
+  const prevGridRef = useRef<DroneAirspaceGrid | null>(null);
+  const prevCapturedAtRef = useRef<string | null>(null);
+  const hasFramedRef = useRef(false);
 
   const sceneCtxRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -134,9 +176,20 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     controls: OrbitControls;
     dynamicGroup: THREE.Group;
     terrainPickMesh: THREE.Mesh | null;
-    worldBounds: { width: number; depth: number; maxY: number };
+    worldBounds: { width: number; depth: number; maxY: number; sceneScale: number };
     requestRender: () => void;
     resetCamera: () => void;
+    startFadeIn: (
+      entries: Array<{
+        material: THREE.Material;
+        targetOpacity: number;
+        baseTransparent: boolean;
+        baseDepthWrite: boolean;
+        startFactor: number;
+      }>,
+      durationMs: number,
+    ) => void;
+    cancelFadeIn: () => void;
   } | null>(null);
 
   // Initialize Three.js renderer, environment, lighting rig, and controls once
@@ -235,6 +288,26 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     let renderDirty = false;
     let disposed = false;
 
+    interface FadeEntry {
+      material: THREE.Material;
+      targetOpacity: number;
+      baseTransparent: boolean;
+      baseDepthWrite: boolean;
+      startFactor: number;
+    }
+
+    const fadeState: {
+      active: boolean;
+      startMs: number;
+      durationMs: number;
+      entries: FadeEntry[];
+    } = {
+      active: false,
+      startMs: 0,
+      durationMs: 300,
+      entries: [],
+    };
+
     const afterDraw = (cb: () => void) => {
       const gl = renderer.getContext() as WebGL2RenderingContext;
       const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -265,15 +338,62 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       frameId = window.requestAnimationFrame(() => {
         if (disposed) return;
         renderDirty = false;
+
+        let transitionActive = false;
+        if (fadeState.active && fadeState.entries.length > 0) {
+          const elapsed = performance.now() - fadeState.startMs;
+          const rawT = Math.min(1, Math.max(0, elapsed / Math.max(1, fadeState.durationMs)));
+          const eased = 1 - Math.pow(1 - rawT, 3);
+          for (const entry of fadeState.entries) {
+            if (rawT >= 1) {
+              entry.material.opacity = entry.targetOpacity;
+              entry.material.transparent = entry.baseTransparent;
+              entry.material.depthWrite = entry.baseDepthWrite;
+            } else {
+              const factor = entry.startFactor + (1 - entry.startFactor) * eased;
+              entry.material.transparent = true;
+              entry.material.opacity = entry.targetOpacity * factor;
+            }
+          }
+          if (rawT >= 1) {
+            fadeState.active = false;
+            fadeState.entries = [];
+          } else {
+            transitionActive = true;
+          }
+        }
+
         controls.update();
         renderer.render(scene, camera);
         const done = () => {
           renderBusy = false;
-          if (renderDirty && !disposed) requestRender();
+          if ((renderDirty || transitionActive) && !disposed) requestRender();
         };
         if (isSoftwareGl) afterDraw(done);
         else done();
       });
+    };
+
+    const cancelFadeIn = () => {
+      fadeState.active = false;
+      fadeState.entries = [];
+    };
+
+    const startFadeIn = (entries: FadeEntry[], durationMs: number) => {
+      if (entries.length === 0 || durationMs <= 0) {
+        cancelFadeIn();
+        requestRender();
+        return;
+      }
+      fadeState.entries = entries;
+      fadeState.startMs = performance.now() - 16;
+      fadeState.durationMs = durationMs;
+      fadeState.active = true;
+      for (const entry of entries) {
+        entry.material.transparent = true;
+        entry.material.opacity = entry.targetOpacity * entry.startFactor;
+      }
+      requestRender();
     };
 
     controls.addEventListener('change', requestRender);
@@ -293,9 +413,11 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       controls,
       dynamicGroup,
       terrainPickMesh: null,
-      worldBounds: { width: 120, depth: 120, maxY: 28 },
+      worldBounds: { width: 120, depth: 120, maxY: 28, sceneScale: 0.05 },
       requestRender,
       resetCamera,
+      startFadeIn,
+      cancelFadeIn,
     };
 
     const resizeObserver = new ResizeObserver(() => {
@@ -331,23 +453,24 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       }
 
       const pt = hits[0].point;
-      const w = ctx.worldBounds.width;
-      const d = ctx.worldBounds.depth;
-      const u = Math.max(0, Math.min(1, (pt.x + w / 2) / w));
-      const v = Math.max(0, Math.min(1, (pt.z + d / 2) / d));
+      const safeScale = Math.max(1e-6, ctx.worldBounds.sceneScale);
+      const eastMeters = pt.x / safeScale;
+      const southMeters = pt.z / safeScale;
+      const [lon, lat] = mapLibreOriginMetersToLngLat(eastMeters, southMeters, g.center);
+
+      const [minLon, minLat, maxLon, maxLat] = g.bbox;
+      const u = Math.max(0, Math.min(1, (lon - minLon) / Math.max(1e-9, maxLon - minLon)));
+      const v = Math.max(0, Math.min(1, (maxLat - lat) / Math.max(1e-9, maxLat - minLat)));
 
       const col = Math.min(g.cols - 1, Math.max(0, Math.round(u * (g.cols - 1))));
       const row = Math.min(g.rows - 1, Math.max(0, Math.round(v * (g.rows - 1))));
       const idx = row * g.cols + col;
 
-      const [minLon, minLat, maxLon, maxLat] = g.bbox;
-      const lon = minLon + u * (maxLon - minLon);
-      const lat = maxLat - v * (maxLat - minLat);
-
       setHoverTelemetry({
         lon,
         lat,
         terrainMeters: Math.round(g.terrainElev[idx] * 10) / 10,
+        rawBuildingMeters: Math.round(g.rawBuildingHeight[idx] * 10) / 10,
         buildingMeters: Math.round(g.bufferedBuildingHeight[idx] * 10) / 10,
         envelopeMeters: Math.round(g.envelopeElev[idx] * 10) / 10,
         ceilingMeters: Math.round(g.ceilingElev[idx] * 10) / 10,
@@ -371,6 +494,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       controls.removeEventListener('change', requestRender);
       controls.dispose();
 
+      cancelFadeIn();
       disposeObject3D(dynamicGroup);
       plinthGeo.dispose();
       plinthMat.dispose();
@@ -389,11 +513,14 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     const ctx = sceneCtxRef.current;
     if (!ctx) return;
 
+    ctx.cancelFadeIn();
     disposeObject3D(ctx.dynamicGroup);
     ctx.dynamicGroup.clear();
     ctx.terrainPickMesh = null;
 
     if (!grid) {
+      prevGridRef.current = null;
+      prevCapturedAtRef.current = null;
       ctx.requestRender();
       return;
     }
@@ -403,69 +530,90 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       rows,
       bbox: [minLon, minLat, maxLon, maxLat],
       center: [cLon, cLat],
-      widthMeters,
-      depthMeters,
       terrainElev,
       envelopeElev,
       ceilingElev,
       clearance,
+      rawBuildingHeight,
       bufferedBuildingHeight,
       minTerrainMeters,
       maxTerrainMeters,
       buildings,
     } = grid;
 
-    // Normalize AOI footprint to ~120 scene units along largest horizontal dimension
-    const maxSpanMeters = Math.max(widthMeters, depthMeters, 100);
+    // Project all Three.js scene coordinates using MapLibre's exact MercatorCoordinate origin
+    const originMerc = maplibregl.MercatorCoordinate.fromLngLat([cLon, cLat], 0);
+    const mercPerMeter = originMerc.meterInMercatorCoordinateUnits();
+    const nwMerc = maplibregl.MercatorCoordinate.fromLngLat([minLon, maxLat], 0);
+    const seMerc = maplibregl.MercatorCoordinate.fromLngLat([maxLon, minLat], 0);
+
+    const mercWidthMeters = Math.max(100, (seMerc.x - nwMerc.x) / mercPerMeter);
+    const mercDepthMeters = Math.max(100, (seMerc.y - nwMerc.y) / mercPerMeter);
+    const maxSpanMeters = Math.max(mercWidthMeters, mercDepthMeters, 100);
     const sceneScale = 120 / maxSpanMeters;
-    const worldW = widthMeters * sceneScale;
-    const worldD = depthMeters * sceneScale;
+    const worldW = mercWidthMeters * sceneScale;
+    const worldD = mercDepthMeters * sceneScale;
 
-    const cosLat = Math.max(0.15, Math.cos((cLat * Math.PI) / 180));
-    const metersPerDegLat = 111319.9;
-    const metersPerDegLon = 111319.9 * cosLat;
-
-    // Map geographic lon/lat + absolute elevation (meters) into Three.js local metric scene coordinates.
-    // Apply a calibrated vertical airspace scale so 15m safety buffers, Overture towers, and 120m ceilings
-    // have crisp 3D vertical separation rather than flattening against a 2km+ terrain cut.
-    const terrainReliefScale = Math.max(1.2, Math.min(2.8, exaggeration * 1.1));
-    const airspaceVerticalScale = sceneScale * Math.max(2.2, exaggeration * 1.55);
+    // Single unified vertical scale across terrain, buildings, envelope, ceiling, and corridor
+    // guarantees strict elevation ordering with zero terrain-slope shearing
+    const verticalScale = sceneScale * Math.max(1.8, exaggeration);
     const yBaseOffset = 2.5;
 
     const toSceneXZ = (lon: number, lat: number): [number, number] => {
-      const x = (lon - cLon) * metersPerDegLon * sceneScale;
-      const z = -(lat - cLat) * metersPerDegLat * sceneScale;
-      return [x, z];
+      const m = maplibregl.MercatorCoordinate.fromLngLat([lon, lat], 0);
+      const eastMeters = (m.x - originMerc.x) / mercPerMeter;
+      const southMeters = (m.y - originMerc.y) / mercPerMeter;
+      return [eastMeters * sceneScale, southMeters * sceneScale];
     };
 
-    const elevToY = (absElev: number, localTerrainElev: number): number => {
-      return (
-        yBaseOffset +
-        (localTerrainElev - minTerrainMeters) * sceneScale * terrainReliefScale +
-        (absElev - localTerrainElev) * airspaceVerticalScale
-      );
+    const elevToY = (absElev: number): number => {
+      return yBaseOffset + (absElev - minTerrainMeters) * verticalScale;
     };
+
+    // Precompute exact MapLibre-origin-aligned XZ coordinates for every grid vertex
+    const gridSceneX = new Float32Array(cols);
+    const gridSceneZ = new Float32Array(rows);
+    for (let c = 0; c < cols; c++) {
+      const u = cols > 1 ? c / (cols - 1) : 0.5;
+      const lon = minLon + u * (maxLon - minLon);
+      const [sx] = toSceneXZ(lon, cLat);
+      gridSceneX[c] = sx;
+    }
+    for (let r = 0; r < rows; r++) {
+      const v = rows > 1 ? r / (rows - 1) : 0.5;
+      const lat = maxLat - v * (maxLat - minLat);
+      const [, sz] = toSceneXZ(cLon, lat);
+      gridSceneZ[r] = sz;
+    }
 
     let maxY = 14;
 
-    // Helper for shared grid topology
+    // Helper for shared grid topology aligned to MapLibre Mercator coordinates
     const buildGridSurfaceGeo = (
       getY: (idx: number) => number,
       getColor: (idx: number) => [number, number, number],
-    ): { fillGeo: THREE.BufferGeometry; lineGeo: THREE.BufferGeometry } => {
+    ): {
+      fillGeo: THREE.BufferGeometry;
+      lineGeo: THREE.BufferGeometry;
+      positions: Float32Array;
+      minY: number;
+      maxSurfY: number;
+    } => {
       const vertCount = cols * rows;
       const positions = new Float32Array(vertCount * 3);
       const colors = new Float32Array(vertCount * 3);
+      let minY = Infinity;
+      let maxSurfY = -Infinity;
 
       for (let r = 0; r < rows; r++) {
-        const v = rows > 1 ? r / (rows - 1) : 0.5;
-        const z = -worldD / 2 + v * worldD;
+        const z = gridSceneZ[r];
         for (let c = 0; c < cols; c++) {
-          const u = cols > 1 ? c / (cols - 1) : 0.5;
-          const x = -worldW / 2 + u * worldW;
+          const x = gridSceneX[c];
           const idx = r * cols + c;
           const y = getY(idx);
           if (y > maxY) maxY = y;
+          if (y < minY) minY = y;
+          if (y > maxSurfY) maxSurfY = y;
           const [cr, cg, cb] = getColor(idx);
 
           positions[idx * 3] = x;
@@ -496,16 +644,28 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       fillGeo.computeVertexNormals();
 
       const lineIndices: number[] = [];
-      for (let r = 0; r < rows; r++) {
+      for (let r = 0; r < rows; r += 2) {
         for (let c = 0; c < cols - 1; c++) {
           const i0 = r * cols + c;
           lineIndices.push(i0, i0 + 1);
         }
       }
-      for (let r = 0; r < rows - 1; r++) {
-        for (let c = 0; c < cols; c++) {
+      if ((rows - 1) % 2 !== 0) {
+        const r = rows - 1;
+        for (let c = 0; c < cols - 1; c++) {
+          lineIndices.push(r * cols + c, r * cols + c + 1);
+        }
+      }
+      for (let c = 0; c < cols; c += 2) {
+        for (let r = 0; r < rows - 1; r++) {
           const i0 = r * cols + c;
           lineIndices.push(i0, i0 + cols);
+        }
+      }
+      if ((cols - 1) % 2 !== 0) {
+        const c = cols - 1;
+        for (let r = 0; r < rows - 1; r++) {
+          lineIndices.push(r * cols + c, (r + 1) * cols + c);
         }
       }
 
@@ -514,26 +674,52 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       lineGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
       lineGeo.setIndex(lineIndices);
 
-      return { fillGeo, lineGeo };
+      return { fillGeo, lineGeo, positions, minY, maxSurfY };
     };
 
     // 1. Solid SRTM/ASTER Terrain Mesh
     const elevRange = Math.max(1, maxTerrainMeters - minTerrainMeters);
-    const { fillGeo: terrainGeo } = buildGridSurfaceGeo(
-      (idx) => elevToY(terrainElev[idx], terrainElev[idx]),
+    const {
+      fillGeo: terrainGeo,
+      positions: terrainPositions,
+      minY: terrainMinY,
+      maxSurfY: terrainMaxY,
+    } = buildGridSurfaceGeo(
+      (idx) => elevToY(terrainElev[idx]),
       (idx) => {
         const t = Math.max(0, Math.min(1, (terrainElev[idx] - minTerrainMeters) / elevRange));
         // Clean hypsometric slate-emerald-ochre scientific ramp
+        let r: number;
+        let g: number;
+        let b: number;
         if (t < 0.35) {
           const k = t / 0.35;
-          return [0.85 - k * 0.08, 0.89 + k * 0.02, 0.88 - k * 0.08];
-        }
-        if (t < 0.72) {
+          r = 0.85 - k * 0.08;
+          g = 0.89 + k * 0.02;
+          b = 0.88 - k * 0.08;
+        } else if (t < 0.72) {
           const k = (t - 0.35) / 0.37;
-          return [0.77 + k * 0.07, 0.91 - k * 0.14, 0.8 - k * 0.24];
+          r = 0.77 + k * 0.07;
+          g = 0.91 - k * 0.14;
+          b = 0.8 - k * 0.24;
+        } else {
+          const k = (t - 0.72) / 0.28;
+          r = 0.84 - k * 0.18;
+          g = 0.77 - k * 0.22;
+          b = 0.56 - k * 0.12;
         }
-        const k = (t - 0.72) / 0.28;
-        return [0.84 - k * 0.18, 0.77 - k * 0.22, 0.56 - k * 0.12];
+
+        if (showBlockedCells) {
+          if (rawBuildingHeight[idx] > 0.5) {
+            // Vivid red tint directly on terrain grid vertices blocked by Overture buildings
+            return [0.86, 0.22, 0.3];
+          }
+          if (bufferedBuildingHeight[idx] > 0.5) {
+            // Warm coral/amber tint for building horizontal safety buffer zone
+            return [r * 0.45 + 0.52, g * 0.45 + 0.24, b * 0.45 + 0.12];
+          }
+        }
+        return [r, g, b];
       },
     );
 
@@ -543,13 +729,14 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       metalness: 0.04,
       side: THREE.DoubleSide,
     });
+    terrainMat.userData.isBaseGeo = true;
     const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
     terrainMesh.receiveShadow = !ctx.renderer.shadowMap.enabled ? false : true;
     terrainMesh.castShadow = false;
     ctx.dynamicGroup.add(terrainMesh);
     ctx.terrainPickMesh = terrainMesh;
 
-    // 1b. Solid Skirt Box Wall around terrain specimen so it reads like a physical terrain cut
+    // 1b. Solid Skirt Box Wall around terrain specimen aligned to MapLibre XZ grid edges
     const skirtPositions: number[] = [];
     const pushSkirtQuad = (x0: number, z0: number, y0: number, x1: number, z1: number, y1: number) => {
       skirtPositions.push(
@@ -557,29 +744,41 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
         x0, 0, z0, x1, y1, z1, x1, 0, z1,
       );
     };
-    const sampleY = (r: number, c: number) => elevToY(terrainElev[r * cols + c], terrainElev[r * cols + c]);
-    const gridX = (c: number) => -worldW / 2 + (c / Math.max(1, cols - 1)) * worldW;
-    const gridZ = (r: number) => -worldD / 2 + (r / Math.max(1, rows - 1)) * worldD;
+    const sampleY = (r: number, c: number) => elevToY(terrainElev[r * cols + c]);
 
     for (let c = 0; c < cols - 1; c++) {
-      pushSkirtQuad(gridX(c), gridZ(0), sampleY(0, c), gridX(c + 1), gridZ(0), sampleY(0, c + 1));
       pushSkirtQuad(
-        gridX(c + 1),
-        gridZ(rows - 1),
+        gridSceneX[c],
+        gridSceneZ[0],
+        sampleY(0, c),
+        gridSceneX[c + 1],
+        gridSceneZ[0],
+        sampleY(0, c + 1),
+      );
+      pushSkirtQuad(
+        gridSceneX[c + 1],
+        gridSceneZ[rows - 1],
         sampleY(rows - 1, c + 1),
-        gridX(c),
-        gridZ(rows - 1),
+        gridSceneX[c],
+        gridSceneZ[rows - 1],
         sampleY(rows - 1, c),
       );
     }
     for (let r = 0; r < rows - 1; r++) {
-      pushSkirtQuad(gridX(0), gridZ(r + 1), sampleY(r + 1, 0), gridX(0), gridZ(r), sampleY(r, 0));
       pushSkirtQuad(
-        gridX(cols - 1),
-        gridZ(r),
+        gridSceneX[0],
+        gridSceneZ[r + 1],
+        sampleY(r + 1, 0),
+        gridSceneX[0],
+        gridSceneZ[r],
+        sampleY(r, 0),
+      );
+      pushSkirtQuad(
+        gridSceneX[cols - 1],
+        gridSceneZ[r],
         sampleY(r, cols - 1),
-        gridX(cols - 1),
-        gridZ(r + 1),
+        gridSceneX[cols - 1],
+        gridSceneZ[r + 1],
         sampleY(r + 1, cols - 1),
       );
     }
@@ -592,42 +791,75 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       metalness: 0.08,
       side: THREE.DoubleSide,
     });
+    skirtMat.userData.isBaseGeo = true;
     ctx.dynamicGroup.add(new THREE.Mesh(skirtGeo, skirtMat));
 
-    // 2. Real Overture 3D Buildings seated on local DEM terrain
-    const sampleTerrainLocal = (lon: number, lat: number): number => {
+    // Bilinear terrain lookup matching droneAirspace.ts and MapLibreDroneMeshLayer
+    const sampleTerrainBilinear = (lon: number, lat: number): number => {
       const u = Math.max(0, Math.min(1, (lon - minLon) / Math.max(1e-9, maxLon - minLon)));
       const v = Math.max(0, Math.min(1, (maxLat - lat) / Math.max(1e-9, maxLat - minLat)));
-      const c = Math.min(cols - 1, Math.max(0, Math.round(u * (cols - 1))));
-      const r = Math.min(rows - 1, Math.max(0, Math.round(v * (rows - 1))));
-      return terrainElev[r * cols + c];
+      const fx = u * (cols - 1);
+      const fy = v * (rows - 1);
+      const c0 = Math.floor(fx);
+      const r0 = Math.floor(fy);
+      const c1 = Math.min(cols - 1, c0 + 1);
+      const r1 = Math.min(rows - 1, r0 + 1);
+      const tx = fx - c0;
+      const ty = fy - r0;
+      const v00 = terrainElev[r0 * cols + c0];
+      const v10 = terrainElev[r0 * cols + c1];
+      const v01 = terrainElev[r1 * cols + c0];
+      const v11 = terrainElev[r1 * cols + c1];
+      return (
+        v00 * (1 - tx) * (1 - ty) +
+        v10 * tx * (1 - ty) +
+        v01 * (1 - tx) * ty +
+        v11 * tx * ty
+      );
     };
 
+    // 2. Real Overture 3D Buildings seated on local DEM terrain with MapLibre origin XZ alignment
     const buildingGroup = new THREE.Group();
     const safeBuildingMat = new THREE.MeshStandardMaterial({
       color: '#475569',
       roughness: 0.52,
       metalness: 0.14,
     });
+    safeBuildingMat.userData.isBaseGeo = true;
     const breachBuildingMat = new THREE.MeshStandardMaterial({
       color: '#BE123C',
       roughness: 0.42,
       metalness: 0.16,
     });
+    breachBuildingMat.userData.isBaseGeo = true;
 
-    const maxRenderBuildings = Math.min(buildings.length, 320);
+    const maxRenderBuildings = Math.min(buildings.length, 360);
+    let debugSampleBuilding: {
+      groundElevM: number;
+      bTerrainMaxM: number;
+      heightMeters: number;
+      baseY: number;
+      topY: number;
+    } | null = null;
+
     for (let bIdx = 0; bIdx < maxRenderBuildings; bIdx++) {
       const b = buildings[bIdx];
       if (b.ring.length < 3) continue;
 
       let sumLon = 0;
       let sumLat = 0;
+      let bTerrainMin = Infinity;
+      let bTerrainMax = -Infinity;
       const shape = new THREE.Shape();
 
       for (let i = 0; i < b.ring.length; i++) {
         const [lon, lat] = b.ring[i];
         sumLon += lon;
         sumLat += lat;
+        const vt = sampleTerrainBilinear(lon, lat);
+        if (vt < bTerrainMin) bTerrainMin = vt;
+        if (vt > bTerrainMax) bTerrainMax = vt;
+
         const [sx, sz] = toSceneXZ(lon, lat);
         // Shape lives in X-Y plane, later rotated -PI/2 around X so shape Y maps to -Z
         if (i === 0) shape.moveTo(sx, -sz);
@@ -636,20 +868,30 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 
       const cBLon = sumLon / b.ring.length;
       const cBLat = sumLat / b.ring.length;
-      const groundElev = sampleTerrainLocal(cBLon, cBLat);
-      const baseY = elevToY(groundElev + b.minHeightMeters, groundElev);
-      const extrudeDepth = Math.max(
-        0.4,
-        (b.heightMeters - b.minHeightMeters) * airspaceVerticalScale,
-      );
+      const groundElev = sampleTerrainBilinear(cBLon, cBLat);
+      if (groundElev > bTerrainMax) bTerrainMax = groundElev;
+      if (groundElev < bTerrainMin) bTerrainMin = groundElev;
+
+      const baseY = elevToY(bTerrainMin + b.minHeightMeters);
+      const topY = elevToY(bTerrainMax + b.heightMeters);
+      const extrudeDepth = Math.max(0.35, topY - baseY);
 
       if (baseY + extrudeDepth > maxY) maxY = baseY + extrudeDepth;
+      if (!debugSampleBuilding) {
+        debugSampleBuilding = {
+          groundElevM: Number(groundElev.toFixed(1)),
+          bTerrainMaxM: Number(bTerrainMax.toFixed(1)),
+          heightMeters: Number(b.heightMeters.toFixed(1)),
+          baseY: Number(baseY.toFixed(3)),
+          topY: Number((baseY + extrudeDepth).toFixed(3)),
+        };
+      }
 
       const bCeiling =
         config.altitudeMode === 'agl'
           ? groundElev + config.ceilingMeters
           : config.ceilingMeters;
-      const isViolating = groundElev + b.heightMeters + config.verticalBufferMeters > bCeiling;
+      const isViolating = bTerrainMax + b.heightMeters + config.verticalBufferMeters > bCeiling;
 
       try {
         const geo = new THREE.ExtrudeGeometry(shape, {
@@ -669,19 +911,247 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     }
     ctx.dynamicGroup.add(buildingGroup);
 
+    // 2b. Visual Indicator for Grid Cells Blocked by Overture Building Geometries:
+    // Color-coded 3D InstancedMesh Voxels + Red-Tinted Cell Tiles & Border Frames
+    let blockedCoreCells = 0;
+    let blockedBufferCells = 0;
+    let blockedBreachCells = 0;
+
+    if (showBlockedCells) {
+      interface BlockedCellSpec {
+        cx: number;
+        cz: number;
+        cw: number;
+        cd: number;
+        yBot: number;
+        yTop: number;
+        x0: number;
+        x1: number;
+        z0: number;
+        z1: number;
+        y00: number;
+        y10: number;
+        y01: number;
+        y11: number;
+        isCore: boolean;
+        isBreach: boolean;
+      }
+
+      const blockedCells: BlockedCellSpec[] = [];
+
+      for (let r = 0; r < rows - 1; r++) {
+        const z0 = gridSceneZ[r];
+        const z1 = gridSceneZ[r + 1];
+        const cz = (z0 + z1) * 0.5;
+        const cd = Math.max(0.15, Math.abs(z1 - z0) * 0.9);
+
+        for (let c = 0; c < cols - 1; c++) {
+          const i00 = r * cols + c;
+          const i10 = i00 + 1;
+          const i01 = (r + 1) * cols + c;
+          const i11 = i01 + 1;
+
+          const rawPeak = Math.max(
+            rawBuildingHeight[i00],
+            rawBuildingHeight[i10],
+            rawBuildingHeight[i01],
+            rawBuildingHeight[i11],
+          );
+          const bufPeak = Math.max(
+            bufferedBuildingHeight[i00],
+            bufferedBuildingHeight[i10],
+            bufferedBuildingHeight[i01],
+            bufferedBuildingHeight[i11],
+          );
+
+          if (bufPeak <= 0.5) continue;
+
+          const isCore = rawPeak > 0.5;
+          const minClr = Math.min(clearance[i00], clearance[i10], clearance[i01], clearance[i11]);
+          const isBreach = minClr < 0;
+
+          if (isCore) blockedCoreCells++;
+          else blockedBufferCells++;
+          if (isBreach) blockedBreachCells++;
+
+          const x0 = gridSceneX[c];
+          const x1 = gridSceneX[c + 1];
+          const cx = (x0 + x1) * 0.5;
+          const cw = Math.max(0.15, Math.abs(x1 - x0) * 0.9);
+
+          const minCellT = Math.min(
+            terrainElev[i00],
+            terrainElev[i10],
+            terrainElev[i01],
+            terrainElev[i11],
+          );
+          const maxCellEnv = Math.max(
+            envelopeElev[i00],
+            envelopeElev[i10],
+            envelopeElev[i01],
+            envelopeElev[i11],
+          );
+
+          blockedCells.push({
+            cx,
+            cz,
+            cw,
+            cd,
+            yBot: elevToY(minCellT),
+            yTop: elevToY(maxCellEnv),
+            x0,
+            x1,
+            z0,
+            z1,
+            y00: elevToY(terrainElev[i00]) + 0.06,
+            y10: elevToY(terrainElev[i10]) + 0.06,
+            y01: elevToY(terrainElev[i01]) + 0.06,
+            y11: elevToY(terrainElev[i11]) + 0.06,
+            isCore,
+            isBreach,
+          });
+        }
+      }
+
+      if (blockedCells.length > 0) {
+        // Instanced 3D voxel columns showing exact obstructed airspace volume per grid cell
+        const voxelGeo = new THREE.BoxGeometry(1, 1, 1);
+        const voxelMat = new THREE.MeshStandardMaterial({
+          color: '#FFFFFF',
+          transparent: true,
+          opacity: 0.34,
+          roughness: 0.38,
+          metalness: 0.05,
+          depthWrite: false,
+        });
+        const voxelMesh = new THREE.InstancedMesh(voxelGeo, voxelMat, blockedCells.length);
+        voxelMesh.renderOrder = 1;
+
+        const dummy = new THREE.Object3D();
+        const color = new THREE.Color();
+
+        // Red-tinted cell tiles & crisp cell grid borders seated flush on terrain
+        const tilePositions = new Float32Array(blockedCells.length * 6 * 3);
+        const tileColors = new Float32Array(blockedCells.length * 6 * 3);
+        const borderPositions: number[] = [];
+        const borderColors: number[] = [];
+
+        blockedCells.forEach((cell, idx) => {
+          const vh = Math.max(0.4, cell.yTop - cell.yBot);
+          dummy.position.set(cell.cx, cell.yBot + vh * 0.5, cell.cz);
+          dummy.scale.set(cell.cw, vh, cell.cd);
+          dummy.updateMatrix();
+          voxelMesh.setMatrixAt(idx, dummy.matrix);
+
+          if (cell.isCore && cell.isBreach) {
+            color.set('#DC2626'); // Deep Crimson: building footprint breaching ceiling
+          } else if (cell.isCore) {
+            color.set('#EF4444'); // Vivid Red: direct building geometry obstruction
+          } else {
+            color.set('#F59E0B'); // Warm Amber: horizontal safety buffer blockage
+          }
+          voxelMesh.setColorAt(idx, color);
+
+          // Red/amber tinted ground quad per blocked cell
+          const [tr, tg, tb] = cell.isCore ? [0.94, 0.24, 0.28] : [0.96, 0.62, 0.12];
+          const pOff = idx * 18;
+          tilePositions[pOff] = cell.x0;
+          tilePositions[pOff + 1] = cell.y00;
+          tilePositions[pOff + 2] = cell.z0;
+          tilePositions[pOff + 3] = cell.x0;
+          tilePositions[pOff + 4] = cell.y01;
+          tilePositions[pOff + 5] = cell.z1;
+          tilePositions[pOff + 6] = cell.x1;
+          tilePositions[pOff + 7] = cell.y10;
+          tilePositions[pOff + 8] = cell.z0;
+
+          tilePositions[pOff + 9] = cell.x1;
+          tilePositions[pOff + 10] = cell.y10;
+          tilePositions[pOff + 11] = cell.z0;
+          tilePositions[pOff + 12] = cell.x0;
+          tilePositions[pOff + 13] = cell.y01;
+          tilePositions[pOff + 14] = cell.z1;
+          tilePositions[pOff + 15] = cell.x1;
+          tilePositions[pOff + 16] = cell.y11;
+          tilePositions[pOff + 17] = cell.z1;
+
+          for (let k = 0; k < 6; k++) {
+            tileColors[pOff + k * 3] = tr;
+            tileColors[pOff + k * 3 + 1] = tg;
+            tileColors[pOff + k * 3 + 2] = tb;
+          }
+
+          const [br, bg, bb] = cell.isCore ? [0.85, 0.11, 0.2] : [0.85, 0.47, 0.04];
+          borderPositions.push(
+            cell.x0, cell.y00 + 0.02, cell.z0, cell.x1, cell.y10 + 0.02, cell.z0,
+            cell.x1, cell.y10 + 0.02, cell.z0, cell.x1, cell.y11 + 0.02, cell.z1,
+            cell.x1, cell.y11 + 0.02, cell.z1, cell.x0, cell.y01 + 0.02, cell.z1,
+            cell.x0, cell.y01 + 0.02, cell.z1, cell.x0, cell.y00 + 0.02, cell.z0,
+          );
+          for (let k = 0; k < 8; k++) {
+            borderColors.push(br, bg, bb);
+          }
+        });
+
+        voxelMesh.instanceMatrix.needsUpdate = true;
+        if (voxelMesh.instanceColor) voxelMesh.instanceColor.needsUpdate = true;
+        ctx.dynamicGroup.add(voxelMesh);
+
+        const tileGeo = new THREE.BufferGeometry();
+        tileGeo.setAttribute('position', new THREE.BufferAttribute(tilePositions, 3));
+        tileGeo.setAttribute('color', new THREE.BufferAttribute(tileColors, 3));
+        const tileMat = new THREE.MeshBasicMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.42,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        });
+        const tileMesh = new THREE.Mesh(tileGeo, tileMat);
+        tileMesh.renderOrder = 1;
+        ctx.dynamicGroup.add(tileMesh);
+
+        const borderGeo = new THREE.BufferGeometry();
+        borderGeo.setAttribute('position', new THREE.Float32BufferAttribute(borderPositions, 3));
+        borderGeo.setAttribute('color', new THREE.Float32BufferAttribute(borderColors, 3));
+        const borderMat = new THREE.LineBasicMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.85,
+        });
+        const borderLines = new THREE.LineSegments(borderGeo, borderMat);
+        borderLines.renderOrder = 2;
+        ctx.dynamicGroup.add(borderLines);
+      }
+    }
+
     // 3. Composite Obstacle Envelope Mesh (terrain + buffered building + vertical buffer)
+    let envPositions: Float32Array | null = null;
+    let envMinY = 0;
+    let envMaxY = 0;
     if (config.showEnvelopeMesh || config.showWireframe) {
-      const { fillGeo: envGeo, lineGeo: envLineGeo } = buildGridSurfaceGeo(
-        (idx) => elevToY(envelopeElev[idx], terrainElev[idx]) + 0.04,
+      const {
+        fillGeo: envGeo,
+        lineGeo: envLineGeo,
+        positions: ePos,
+        minY: eMinY,
+        maxSurfY: eMaxY,
+      } = buildGridSurfaceGeo(
+        (idx) => elevToY(envelopeElev[idx]) + 0.08,
         (idx) => {
           const clr = clearance[idx];
+          const rawB = rawBuildingHeight[idx];
           const bH = bufferedBuildingHeight[idx];
           if (clr < 0) return [0.88, 0.11, 0.28]; // Violation Rose
+          if (rawB > 0.5) return [0.92, 0.28, 0.26]; // Blocked by Overture building footprint
           if (clr < 15) return [0.85, 0.47, 0.02]; // Caution Amber
-          if (bH > 0.5) return [0.03, 0.57, 0.7]; // Urban obstacle Teal
+          if (bH > 0.5) return [0.03, 0.57, 0.7]; // Urban obstacle buffer Teal
           return [0.05, 0.58, 0.53]; // Clear terrain buffer
         },
       );
+      envPositions = ePos;
+      envMinY = eMinY;
+      envMaxY = eMaxY;
 
       if (config.showEnvelopeMesh) {
         const envMat = new THREE.MeshPhysicalMaterial({
@@ -715,9 +1185,16 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     }
 
     // 4. Safe Flight Ceiling Mesh (AGL terrain-following or MSL flat datum)
+    let ceilMinY = 0;
+    let ceilMaxY = 0;
     if (config.showCeilingMesh) {
-      const { fillGeo: ceilGeo, lineGeo: ceilLineGeo } = buildGridSurfaceGeo(
-        (idx) => elevToY(ceilingElev[idx], terrainElev[idx]) + 0.08,
+      const {
+        fillGeo: ceilGeo,
+        lineGeo: ceilLineGeo,
+        minY: cMinY,
+        maxSurfY: cMaxY,
+      } = buildGridSurfaceGeo(
+        (idx) => elevToY(ceilingElev[idx]) + 0.14,
         (idx) => {
           const clr = clearance[idx];
           if (clr < 0) return [0.96, 0.22, 0.35];
@@ -725,6 +1202,8 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
           return [0.02, 0.71, 0.83];
         },
       );
+      ceilMinY = cMinY;
+      ceilMaxY = cMaxY;
 
       const ceilMat = new THREE.MeshPhysicalMaterial({
         vertexColors: true,
@@ -753,16 +1232,16 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       }
     }
 
-    // 5. Optional 3D Flight Corridor Path + Waypoint Pylons
+    // 5. Optional 3D Flight Corridor Path + Obstacle-Aware Climb Path + Waypoint Pylons
     if (corridorAnalysis && corridorAnalysis.samples.length >= 2) {
       const pts: THREE.Vector3[] = corridorAnalysis.samples.map((s) => {
         const [sx, sz] = toSceneXZ(s.lon, s.lat);
-        const sy = elevToY(s.ceilingMeters, s.terrainMeters) + 0.16;
+        const sy = elevToY(s.ceilingMeters) + 0.22;
         return new THREE.Vector3(sx, sy, sz);
       });
 
       const curve = new THREE.CatmullRomCurve3(pts);
-      const tubeGeo = new THREE.TubeGeometry(curve, 72, 0.45, 8, false);
+      const tubeGeo = new THREE.TubeGeometry(curve, 72, 0.42, 8, false);
       const pathColor =
         corridorAnalysis.summary.status === 'VIOLATION'
           ? '#E11D48'
@@ -776,6 +1255,22 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
       });
       ctx.dynamicGroup.add(new THREE.Mesh(tubeGeo, tubeMat));
 
+      if (config.autoClimbCorridor) {
+        const safePts: THREE.Vector3[] = corridorAnalysis.samples.map((s) => {
+          const [sx, sz] = toSceneXZ(s.lon, s.lat);
+          const sy = elevToY(s.safeFlightMeters) + 0.34;
+          return new THREE.Vector3(sx, sy, sz);
+        });
+        const safeCurve = new THREE.CatmullRomCurve3(safePts);
+        const safeTubeGeo = new THREE.TubeGeometry(safeCurve, 72, 0.46, 8, false);
+        const safeTubeMat = new THREE.MeshStandardMaterial({
+          color: '#10B981',
+          roughness: 0.25,
+          metalness: 0.18,
+        });
+        ctx.dynamicGroup.add(new THREE.Mesh(safeTubeGeo, safeTubeMat));
+      }
+
       const pylonMat = new THREE.MeshStandardMaterial({
         color: '#0F172A',
         roughness: 0.35,
@@ -784,11 +1279,13 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 
       corridorAnalysis.waypoints.forEach(([lon, lat]) => {
         const [sx, sz] = toSceneXZ(lon, lat);
-        const gElev = sampleTerrainLocal(lon, lat);
+        const gElev = sampleTerrainBilinear(lon, lat);
         const cElev =
           config.altitudeMode === 'agl' ? gElev + config.ceilingMeters : config.ceilingMeters;
-        const yBot = elevToY(gElev, gElev);
-        const yTop = elevToY(cElev, gElev);
+        const envElev = gElev + config.verticalBufferMeters;
+        const topElev = config.autoClimbCorridor ? Math.max(cElev, envElev + 5) : cElev;
+        const yBot = elevToY(gElev);
+        const yTop = elevToY(topElev) + 0.34;
         const h = Math.max(1, yTop - yBot);
 
         const pylonGeo = new THREE.CylinderGeometry(0.42, 0.42, h, 10);
@@ -808,10 +1305,10 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     const cornerLinePos: number[] = [];
     for (const { r, c } of cornerIndices) {
       const idx = r * cols + c;
-      const x = gridX(c);
-      const z = gridZ(r);
-      const yBot = elevToY(terrainElev[idx], terrainElev[idx]);
-      const yTop = elevToY(ceilingElev[idx], terrainElev[idx]) + 0.08;
+      const x = gridSceneX[c];
+      const z = gridSceneZ[r];
+      const yBot = elevToY(terrainElev[idx]);
+      const yTop = elevToY(ceilingElev[idx]) + 0.14;
       cornerLinePos.push(x, yBot, z, x, yTop, z);
     }
     const cornerGeo = new THREE.BufferGeometry();
@@ -823,14 +1320,101 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
     });
     ctx.dynamicGroup.add(new THREE.LineSegments(cornerGeo, cornerMat));
 
-    const hadPrevBounds = ctx.terrainPickMesh !== null;
-    ctx.worldBounds = { width: worldW, depth: worldD, maxY };
-    if (!hadPrevBounds) {
+    // Structured Three.js scene coordinate & buffer vertex debug log
+    const centerIdx = Math.floor(rows / 2) * cols + Math.floor(cols / 2);
+    const readPos = (arr: Float32Array, idx: number) => [
+      Number(arr[idx * 3].toFixed(2)),
+      Number(arr[idx * 3 + 1].toFixed(2)),
+      Number(arr[idx * 3 + 2].toFixed(2)),
+    ];
+    console.info('[DroneMeshInspector] Three.js buffer vertices', {
+      originCenterLngLat: [Number(cLon.toFixed(5)), Number(cLat.toFixed(5))],
+      originMercator: [Number(originMerc.x.toFixed(6)), Number(originMerc.y.toFixed(6))],
+      mercPerMeter: Number(mercPerMeter.toExponential(4)),
+      sceneScale: Number(sceneScale.toFixed(5)),
+      verticalScale: Number(verticalScale.toFixed(5)),
+      terrainPositionStats: {
+        vertexCount: cols * rows,
+        minY: Number(terrainMinY.toFixed(2)),
+        maxY: Number(terrainMaxY.toFixed(2)),
+        sampleXYZ: {
+          nw: readPos(terrainPositions, 0),
+          center: readPos(terrainPositions, centerIdx),
+          se: readPos(terrainPositions, cols * rows - 1),
+        },
+      },
+      envelopePositionStats: envPositions
+        ? {
+            minY: Number(envMinY.toFixed(2)),
+            maxY: Number(envMaxY.toFixed(2)),
+            sampleXYZ: {
+              nw: readPos(envPositions, 0),
+              center: readPos(envPositions, centerIdx),
+              se: readPos(envPositions, cols * rows - 1),
+            },
+          }
+        : null,
+      ceilingPositionStats: config.showCeilingMesh
+        ? { minY: Number(ceilMinY.toFixed(2)), maxY: Number(ceilMaxY.toFixed(2)) }
+        : null,
+      blockedCellsStats: {
+        visible: showBlockedCells,
+        coreBuildingCells: blockedCoreCells,
+        bufferCells: blockedBufferCells,
+        breachCells: blockedBreachCells,
+      },
+      sampleBuilding: debugSampleBuilding,
+    });
+
+    const isResampledGrid = grid.capturedAt !== prevCapturedAtRef.current;
+    const isUpdatedGrid = grid !== prevGridRef.current;
+    prevGridRef.current = grid;
+    prevCapturedAtRef.current = grid.capturedAt;
+
+    ctx.worldBounds = { width: worldW, depth: worldD, maxY, sceneScale };
+    if (!hasFramedRef.current) {
+      hasFramedRef.current = true;
       ctx.resetCamera();
+    }
+
+    const prefersReducedMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    if ((isResampledGrid || isUpdatedGrid) && !prefersReducedMotion) {
+      const seenMaterials = new Set<THREE.Material>();
+      const fadeEntries: Array<{
+        material: THREE.Material;
+        targetOpacity: number;
+        baseTransparent: boolean;
+        baseDepthWrite: boolean;
+        startFactor: number;
+      }> = [];
+
+      ctx.dynamicGroup.traverse((obj) => {
+        const renderable = obj as THREE.Mesh | THREE.LineSegments;
+        const mat = renderable.material;
+        const mats = Array.isArray(mat) ? mat : mat ? [mat] : [];
+        for (const m of mats) {
+          if (seenMaterials.has(m)) continue;
+          seenMaterials.add(m);
+          if (!isResampledGrid && m.userData?.isBaseGeo) continue;
+          fadeEntries.push({
+            material: m,
+            targetOpacity: m.opacity,
+            baseTransparent: m.transparent,
+            baseDepthWrite: m.depthWrite,
+            startFactor: isResampledGrid ? 0.08 : 0.55,
+          });
+        }
+      });
+
+      ctx.startFadeIn(fadeEntries, isResampledGrid ? 300 : 180);
     } else {
       ctx.requestRender();
     }
-  }, [grid, config, corridorAnalysis, exaggeration]);
+  }, [grid, config, corridorAnalysis, exaggeration, showBlockedCells]);
 
   const statusBadge = (() => {
     if (!grid) return { label: 'NO GRID', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
@@ -865,7 +1449,7 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
               </div>
               <p className="text-[11px] text-slate-500 font-mono tabular-nums truncate">
                 {grid
-                  ? `AOI ${(grid.widthMeters / 1000).toFixed(2)} × ${(grid.depthMeters / 1000).toFixed(2)} km · ${grid.buildingCount} Overture footprints · Drag to orbit, Scroll to zoom`
+                  ? `AOI ${(grid.widthMeters / 1000).toFixed(2)} × ${(grid.depthMeters / 1000).toFixed(2)} km · ${grid.buildingCount} Overture footprints · ${blockedCellStats.core} blocked cells (${blockedCellStats.buffer} buffer)`
                   : 'Sampling SRTM terrain & Overture structures...'}
               </p>
             </div>
@@ -893,6 +1477,10 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                 >
                   {grid.minClearanceMeters > 0 ? `+${grid.minClearanceMeters}` : grid.minClearanceMeters}m
                 </div>
+              </div>
+              <div>
+                <div className="text-[9px] uppercase tracking-wider text-slate-400">Blocked Cells</div>
+                <div className="font-semibold text-red-600">{blockedCellStats.core}</div>
               </div>
               <div>
                 <div className="text-[9px] uppercase tracking-wider text-slate-400">Max Obstacle</div>
@@ -959,7 +1547,15 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
 
           {/* Top-Left Compact Color Key & Hover Readout (Solid opaque surface, zero backdrop-blur) */}
           <div className="pointer-events-none absolute top-3 left-3 flex flex-col gap-2 z-10">
-            <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[10px] font-mono text-slate-700 flex items-center gap-3 shadow-xs">
+            <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[10px] font-mono text-slate-700 flex flex-wrap items-center gap-3 shadow-xs">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-xs bg-red-500 inline-block" />
+                Blocked Cell (Bldg)
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-xs bg-amber-400 inline-block" />
+                Buffer Voxel
+              </span>
               <span className="flex items-center gap-1.5">
                 <span className="w-2.5 h-2.5 rounded-xs bg-teal-600 inline-block" />
                 Buffer Envelope
@@ -969,27 +1565,46 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                 Safe Ceiling
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-xs bg-amber-500 inline-block" />
-                Caution (&lt;15m)
-              </span>
-              <span className="flex items-center gap-1.5">
                 <span className="w-2.5 h-2.5 rounded-xs bg-rose-600 inline-block" />
                 Breach (&lt;0m)
               </span>
             </div>
 
             {hoverTelemetry && (
-              <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[11px] font-mono tabular-nums text-slate-700 shadow-xs space-y-0.5 max-w-[290px]">
-                <div className="text-[10px] text-slate-400">
-                  {hoverTelemetry.lat.toFixed(5)}°, {hoverTelemetry.lon.toFixed(5)}°
+              <div className="bg-white/95 border border-slate-200 rounded-md px-3 py-2 text-[11px] font-mono tabular-nums text-slate-700 shadow-xs space-y-0.5 max-w-[300px]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-slate-400">
+                    {hoverTelemetry.lat.toFixed(5)}°, {hoverTelemetry.lon.toFixed(5)}°
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.5 text-[9px] font-semibold rounded border ${
+                      hoverTelemetry.rawBuildingMeters > 0.5
+                        ? 'bg-red-50 text-red-700 border-red-200'
+                        : hoverTelemetry.buildingMeters > 0.5
+                          ? 'bg-amber-50 text-amber-700 border-amber-200'
+                          : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    }`}
+                  >
+                    {hoverTelemetry.rawBuildingMeters > 0.5
+                      ? 'BLOCKED CELL'
+                      : hoverTelemetry.buildingMeters > 0.5
+                        ? 'BUFFER ZONE'
+                        : 'CLEAR CELL'}
+                  </span>
                 </div>
                 <div className="flex justify-between gap-4">
                   <span>Terrain DEM:</span>
                   <strong className="text-slate-900">{hoverTelemetry.terrainMeters} m</strong>
                 </div>
                 <div className="flex justify-between gap-4">
-                  <span>Building Height:</span>
-                  <strong className="text-slate-900">{hoverTelemetry.buildingMeters} m</strong>
+                  <span>Building (Raw / Buf):</span>
+                  <strong
+                    className={
+                      hoverTelemetry.rawBuildingMeters > 0.5 ? 'text-red-600' : 'text-slate-900'
+                    }
+                  >
+                    {hoverTelemetry.rawBuildingMeters} / {hoverTelemetry.buildingMeters} m
+                  </strong>
                 </div>
                 <div className="flex justify-between gap-4">
                   <span>Obstacle Envelope:</span>
@@ -1085,6 +1700,32 @@ export const DroneMeshInspector: React.FC<DroneMeshInspectorProps> = ({
                   >
                     <Grid className="w-3 h-3" />
                     Wireframe
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onChangeConfig((p) => ({ ...p, autoClimbCorridor: !p.autoClimbCorridor }))
+                    }
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                      config.autoClimbCorridor
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                        : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    <Route className="w-3 h-3" />
+                    Safe Climb
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowBlockedCells((v) => !v)}
+                    className={`px-2.5 py-1 rounded border text-[11px] font-medium flex items-center gap-1 cursor-pointer ${
+                      showBlockedCells
+                        ? 'bg-red-50 border-red-200 text-red-800'
+                        : 'bg-[#F8FAFC] border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    <Box className="w-3 h-3" />
+                    Blocked Voxels
                   </button>
                 </div>
 

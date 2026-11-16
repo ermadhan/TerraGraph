@@ -1,5 +1,17 @@
 import React, { useState, useMemo } from 'react';
 import { Download, ChevronDown, ChevronUp, X } from 'lucide-react';
+import {
+  Area,
+  CartesianGrid,
+  ComposedChart,
+  Line,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import type { TooltipContentProps } from 'recharts';
 import type { DiscrepancyGridResult, ElevationProfileResult, ProfileSample } from '../types/geospatial';
 
 interface TelemetryTrayProps {
@@ -11,6 +23,46 @@ interface TelemetryTrayProps {
   onCloseTray: () => void;
 }
 
+const TerrainProfileTooltip: React.FC<Partial<TooltipContentProps>> = ({
+  active,
+  payload,
+}) => {
+  if (!active || !payload || payload.length === 0) return null;
+  const sample = payload[0]?.payload as ProfileSample | undefined;
+  if (!sample) return null;
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-md shadow-sm px-2.5 py-2 text-[11px] font-mono tabular-nums text-slate-700 space-y-1">
+      <div className="flex items-center justify-between gap-3 pb-1 border-b border-slate-100 text-[10px] text-slate-500">
+        <span>{sample.distanceKm.toFixed(2)} km</span>
+        <span>
+          {sample.lat.toFixed(4)}°, {sample.lon.toFixed(4)}°
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-slate-600">SRTM 30m</span>
+        <strong className="text-blue-700">
+          {sample.srtmMeters !== null ? `${sample.srtmMeters.toFixed(1)} m` : 'N/A'}
+        </strong>
+      </div>
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-slate-600">ASTER 30m</span>
+        <strong className="text-amber-700">
+          {sample.asterMeters !== null ? `${sample.asterMeters.toFixed(1)} m` : 'N/A'}
+        </strong>
+      </div>
+      <div className="flex items-center justify-between gap-4 pt-0.5 border-t border-slate-100">
+        <span className="text-slate-500">Δh (ASTER − SRTM)</span>
+        <strong className="text-slate-900">
+          {sample.deltaMeters !== null
+            ? `${sample.deltaMeters > 0 ? '+' : ''}${sample.deltaMeters.toFixed(1)} m`
+            : 'N/A'}
+        </strong>
+      </div>
+    </div>
+  );
+};
+
 export const TelemetryTray: React.FC<TelemetryTrayProps> = ({
   profile,
   discrepancyGrid,
@@ -21,22 +73,34 @@ export const TelemetryTray: React.FC<TelemetryTrayProps> = ({
 }) => {
   const [minimized, setMinimized] = useState(false);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  const [showSrtm, setShowSrtm] = useState(true);
+  const [showAster, setShowAster] = useState(true);
 
   const chartBounds = useMemo(() => {
     if (!profile || profile.samples.length === 0) return null;
     const vals: number[] = [];
+    let srtmCount = 0;
+    let asterCount = 0;
     for (const s of profile.samples) {
-      if (s.srtmMeters !== null) vals.push(s.srtmMeters);
-      if (s.asterMeters !== null) vals.push(s.asterMeters);
+      if (s.srtmMeters !== null) {
+        vals.push(s.srtmMeters);
+        srtmCount++;
+      }
+      if (s.asterMeters !== null) {
+        vals.push(s.asterMeters);
+        asterCount++;
+      }
     }
     if (vals.length === 0) return null;
     const rawMin = Math.min(...vals);
     const rawMax = Math.max(...vals);
     const pad = Math.max(15, (rawMax - rawMin) * 0.12);
     return {
-      minElev: rawMin - pad,
-      maxElev: rawMax + pad,
+      minElev: Math.floor(rawMin - pad),
+      maxElev: Math.ceil(rawMax + pad),
       maxDist: Math.max(0.01, profile.totalDistanceKm),
+      hasSrtm: srtmCount >= 2,
+      hasAster: asterCount >= 2,
     };
   }, [profile]);
 
@@ -105,6 +169,16 @@ export const TelemetryTray: React.FC<TelemetryTrayProps> = ({
       ? profile.samples[hoveredIdx]
       : null;
 
+  const toggleSrtm = () => {
+    if (showSrtm && !showAster) return;
+    setShowSrtm((v) => !v);
+  };
+
+  const toggleAster = () => {
+    if (showAster && !showSrtm) return;
+    setShowAster((v) => !v);
+  };
+
   return (
     <section className="shrink-0 bg-white border-t border-slate-200 z-20">
       {/* Tray Header */}
@@ -167,25 +241,41 @@ export const TelemetryTray: React.FC<TelemetryTrayProps> = ({
       </div>
 
       {!minimized && (
-        <div className="h-[210px] px-4 py-3 flex items-stretch gap-5">
+        <div className="h-[228px] px-4 py-3 flex items-stretch gap-5">
           {activeTab === 'profile' && profile && (
             <>
-              {/* SVG Dual-Axis Profile Chart */}
+              {/* Recharts Terrain Elevation Profile Chart */}
               <div className="flex-1 min-w-0 flex flex-col">
-                <div className="flex items-center justify-between text-[11px] mb-1.5">
-                  <div className="flex items-center gap-4 text-slate-600">
-                    <span className="flex items-center gap-1.5">
+                <div className="flex items-center justify-between text-[11px] mb-1.5 gap-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={toggleSrtm}
+                      className={`flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] transition-colors cursor-pointer whitespace-nowrap ${
+                        showSrtm
+                          ? 'bg-blue-50/70 border-blue-200 text-slate-800'
+                          : 'bg-white border-slate-200 text-slate-400'
+                      }`}
+                    >
                       <span className="w-3 h-0.5 bg-blue-600 inline-block" />
                       NASA SRTM 30m
-                    </span>
-                    <span className="flex items-center gap-1.5">
+                    </button>
+                    <button
+                      type="button"
+                      onClick={toggleAster}
+                      className={`flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] transition-colors cursor-pointer whitespace-nowrap ${
+                        showAster
+                          ? 'bg-amber-50/70 border-amber-200 text-slate-800'
+                          : 'bg-white border-slate-200 text-slate-400'
+                      }`}
+                    >
                       <span className="w-3 h-0.5 border-b-2 border-dashed border-amber-600 inline-block" />
                       NASA/METI ASTER 30m
-                    </span>
+                    </button>
                   </div>
 
                   {hoveredSample ? (
-                    <div className="font-mono tabular-nums text-[11px] text-slate-800 flex items-center gap-3">
+                    <div className="font-mono tabular-nums text-[11px] text-slate-800 flex items-center gap-3 truncate">
                       <span>{hoveredSample.distanceKm.toFixed(2)} km</span>
                       <span>
                         SRTM:{' '}
@@ -213,129 +303,156 @@ export const TelemetryTray: React.FC<TelemetryTrayProps> = ({
                       </span>
                     </div>
                   ) : (
-                    <span className="text-[11px] text-slate-400">
-                      Hover chart to scrub 3D transect position
+                    <span className="text-[11px] text-slate-400 truncate">
+                      Hover chart to inspect elevation &amp; scrub 3D transect marker
                     </span>
                   )}
                 </div>
 
                 {chartBounds ? (
-                  <div
-                    className="relative flex-1 w-full border border-slate-200 rounded bg-[#F8FAFC]"
-                    onMouseLeave={() => {
-                      setHoveredIdx(null);
-                      onHoverSample(null);
-                    }}
-                  >
-                    <svg
-                      viewBox="0 0 800 140"
-                      preserveAspectRatio="none"
-                      className="w-full h-full cursor-crosshair"
-                      onMouseMove={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        const relX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                        const idx = Math.round(relX * (profile.samples.length - 1));
-                        setHoveredIdx(idx);
-                        onHoverSample(profile.samples[idx] || null);
-                      }}
-                    >
-                      {/* Horizontal Reference Grid Lines */}
-                      {[0.25, 0.5, 0.75].map((frac) => (
-                        <line
-                          key={frac}
-                          x1={0}
-                          x2={800}
-                          y1={frac * 140}
-                          y2={frac * 140}
-                          stroke="#E2E8F0"
-                          strokeWidth={1}
+                  <div className="relative flex-1 min-h-0 w-full border border-slate-200 rounded bg-[#F8FAFC] pr-1 pt-1.5 pb-0.5">
+                    <ResponsiveContainer width="100%" height="100%" minWidth={200} minHeight={120}>
+                      <ComposedChart
+                        data={profile.samples}
+                        margin={{ top: 6, right: 14, left: 2, bottom: 2 }}
+                        onMouseMove={(state) => {
+                          const rawIdx = state?.activeTooltipIndex;
+                          const idx =
+                            typeof rawIdx === 'number'
+                              ? rawIdx
+                              : typeof rawIdx === 'string' && rawIdx !== ''
+                                ? Number(rawIdx)
+                                : NaN;
+                          if (Number.isInteger(idx) && idx >= 0 && idx < profile.samples.length) {
+                            setHoveredIdx(idx);
+                            onHoverSample(profile.samples[idx]);
+                          }
+                        }}
+                        onMouseLeave={() => {
+                          setHoveredIdx(null);
+                          onHoverSample(null);
+                        }}
+                      >
+                        <defs>
+                          <linearGradient id="srtmTerrainFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="#2563EB" stopOpacity={0.24} />
+                            <stop offset="85%" stopColor="#2563EB" stopOpacity={0.05} />
+                            <stop offset="100%" stopColor="#2563EB" stopOpacity={0.01} />
+                          </linearGradient>
+                          <linearGradient id="asterTerrainFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="#D97706" stopOpacity={0.2} />
+                            <stop offset="100%" stopColor="#D97706" stopOpacity={0.02} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid stroke="#E2E8F0" strokeDasharray="3 3" />
+                        <XAxis
+                          dataKey="distanceKm"
+                          type="number"
+                          domain={[0, chartBounds.maxDist]}
+                          tickFormatter={(v) => `${Number(v).toFixed(1)} km`}
+                          tick={{
+                            fontSize: 10,
+                            fill: '#64748B',
+                            fontFamily: 'IBM Plex Mono, monospace',
+                          }}
+                          stroke="#CBD5E1"
+                          tickLine={false}
+                          minTickGap={40}
                         />
-                      ))}
-
-                      {/* SRTM Fill + Solid Path */}
-                      {(() => {
-                        const pts = profile.samples
-                          .map((s, i) => {
-                            if (s.srtmMeters === null) return null;
-                            const x = (i / Math.max(1, profile.samples.length - 1)) * 800;
-                            const y =
-                              130 -
-                              ((s.srtmMeters - chartBounds.minElev) /
-                                Math.max(1, chartBounds.maxElev - chartBounds.minElev)) *
-                                118;
-                            return { x, y };
-                          })
-                          .filter((p): p is { x: number; y: number } => p !== null);
-
-                        if (pts.length < 2) return null;
-                        const d = pts
-                          .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
-                          .join(' ');
-                        const areaD = `${d} L ${pts[pts.length - 1].x.toFixed(1)} 140 L ${pts[0].x.toFixed(1)} 140 Z`;
-
-                        return (
-                          <>
-                            <path d={areaD} fill="rgba(37, 99, 235, 0.08)" />
-                            <path d={d} fill="none" stroke="#2563EB" strokeWidth={2} />
-                          </>
-                        );
-                      })()}
-
-                      {/* ASTER Dashed Path */}
-                      {(() => {
-                        const pts = profile.samples
-                          .map((s, i) => {
-                            if (s.asterMeters === null) return null;
-                            const x = (i / Math.max(1, profile.samples.length - 1)) * 800;
-                            const y =
-                              130 -
-                              ((s.asterMeters - chartBounds.minElev) /
-                                Math.max(1, chartBounds.maxElev - chartBounds.minElev)) *
-                                118;
-                            return { x, y };
-                          })
-                          .filter((p): p is { x: number; y: number } => p !== null);
-
-                        if (pts.length < 2) return null;
-                        const d = pts
-                          .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
-                          .join(' ');
-
-                        return (
-                          <path
-                            d={d}
-                            fill="none"
-                            stroke="#D97706"
-                            strokeWidth={1.75}
-                            strokeDasharray="5 3"
+                        <YAxis
+                          domain={[chartBounds.minElev, chartBounds.maxElev]}
+                          width={54}
+                          tickFormatter={(v) => `${Math.round(Number(v))} m`}
+                          tick={{
+                            fontSize: 10,
+                            fill: '#64748B',
+                            fontFamily: 'IBM Plex Mono, monospace',
+                          }}
+                          stroke="#CBD5E1"
+                          tickLine={false}
+                          axisLine={false}
+                        />
+                        <Tooltip
+                          cursor={{ stroke: '#0F172A', strokeWidth: 1, strokeDasharray: '2 2' }}
+                          content={<TerrainProfileTooltip />}
+                        />
+                        {chartBounds.minElev < 0 && chartBounds.maxElev > 0 && (
+                          <ReferenceLine
+                            y={0}
+                            stroke="#94A3B8"
+                            strokeDasharray="4 4"
+                            label={{
+                              value: 'MSL 0m',
+                              position: 'insideTopRight',
+                              fill: '#64748B',
+                              fontSize: 9,
+                              fontFamily: 'IBM Plex Mono, monospace',
+                            }}
                           />
-                        );
-                      })()}
-
-                      {/* Crosshair Line */}
-                      {hoveredIdx !== null && (
-                        <line
-                          x1={(hoveredIdx / Math.max(1, profile.samples.length - 1)) * 800}
-                          x2={(hoveredIdx / Math.max(1, profile.samples.length - 1)) * 800}
-                          y1={0}
-                          y2={140}
-                          stroke="#0F172A"
-                          strokeWidth={1}
-                          strokeDasharray="2 2"
-                        />
-                      )}
-                    </svg>
-
-                    {/* Min / Max Axis Labels */}
-                    <div className="pointer-events-none absolute top-1 left-2 text-[10px] font-mono tabular-nums text-slate-400">
-                      {Math.round(chartBounds.maxElev)} m
-                    </div>
-                    <div className="pointer-events-none absolute bottom-1 left-2 text-[10px] font-mono tabular-nums text-slate-400">
-                      {Math.round(chartBounds.minElev)} m
-                    </div>
-                    <div className="pointer-events-none absolute bottom-1 right-2 text-[10px] font-mono tabular-nums text-slate-400">
-                      {profile.totalDistanceKm.toFixed(2)} km
-                    </div>
+                        )}
+                        {showSrtm && chartBounds.hasSrtm && (
+                          <Area
+                            type="monotone"
+                            dataKey="srtmMeters"
+                            name="NASA SRTM 30m"
+                            stroke="#2563EB"
+                            strokeWidth={2}
+                            fill="url(#srtmTerrainFill)"
+                            baseValue={chartBounds.minElev}
+                            connectNulls
+                            isAnimationActive={false}
+                            dot={false}
+                            activeDot={{
+                              r: 3.5,
+                              fill: '#2563EB',
+                              stroke: '#FFFFFF',
+                              strokeWidth: 1.5,
+                            }}
+                          />
+                        )}
+                        {showAster &&
+                          chartBounds.hasAster &&
+                          (!showSrtm || !chartBounds.hasSrtm ? (
+                            <Area
+                              type="monotone"
+                              dataKey="asterMeters"
+                              name="NASA/METI ASTER 30m"
+                              stroke="#D97706"
+                              strokeWidth={1.75}
+                              strokeDasharray="5 3"
+                              fill="url(#asterTerrainFill)"
+                              baseValue={chartBounds.minElev}
+                              connectNulls
+                              isAnimationActive={false}
+                              dot={false}
+                              activeDot={{
+                                r: 3.5,
+                                fill: '#D97706',
+                                stroke: '#FFFFFF',
+                                strokeWidth: 1.5,
+                              }}
+                            />
+                          ) : (
+                            <Line
+                              type="monotone"
+                              dataKey="asterMeters"
+                              name="NASA/METI ASTER 30m"
+                              stroke="#D97706"
+                              strokeWidth={1.75}
+                              strokeDasharray="5 3"
+                              connectNulls
+                              isAnimationActive={false}
+                              dot={false}
+                              activeDot={{
+                                r: 3.5,
+                                fill: '#D97706',
+                                stroke: '#FFFFFF',
+                                strokeWidth: 1.5,
+                              }}
+                            />
+                          ))}
+                      </ComposedChart>
+                    </ResponsiveContainer>
                   </div>
                 ) : (
                   <div className="flex-1 flex items-center justify-center text-xs text-slate-400 border border-slate-200 rounded bg-[#F8FAFC]">

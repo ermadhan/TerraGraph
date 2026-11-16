@@ -742,6 +742,7 @@ export const ControlSidebar: React.FC<ControlSidebarProps> = ({
                     ['showEnvelopeMesh', 'Obstacle Envelope Surface'],
                     ['showCeilingMesh', 'Safe Flight Ceiling Surface'],
                     ['showWireframe', '3D Wireframe Grid'],
+                    ['autoClimbCorridor', 'Obstacle-Aware Corridor Climb'],
                   ] as Array<[keyof DroneZoneConfig, string]>
                 ).map(([key, label]) => (
                   <label
@@ -1007,25 +1008,35 @@ export const ControlSidebar: React.FC<ControlSidebarProps> = ({
                       </span>
                     </div>
                     {droneCorridorAnalysis && (
-                      <div className="pt-1 border-t border-slate-200 flex justify-between items-center">
-                        <span className="text-slate-600">
-                          Corridor ({droneCorridorAnalysis.waypoints.length} WPs)
-                        </span>
-                        <span
-                          className={`px-1.5 py-0.5 text-[10px] font-semibold rounded border ${
-                            droneCorridorAnalysis.summary.status === 'VIOLATION'
-                              ? 'bg-rose-50 text-rose-700 border-rose-200'
-                              : droneCorridorAnalysis.summary.status === 'CAUTION'
-                                ? 'bg-amber-50 text-amber-700 border-amber-200'
-                                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                          }`}
-                        >
-                          {droneCorridorAnalysis.summary.status} ·{' '}
-                          {droneCorridorAnalysis.summary.minClearanceMeters > 0
-                            ? `+${droneCorridorAnalysis.summary.minClearanceMeters}`
-                            : droneCorridorAnalysis.summary.minClearanceMeters}
-                          m
-                        </span>
+                      <div className="pt-1 border-t border-slate-200 space-y-1">
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-600">
+                            Corridor ({droneCorridorAnalysis.waypoints.length} WPs)
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.5 text-[10px] font-semibold rounded border ${
+                              droneCorridorAnalysis.summary.status === 'VIOLATION'
+                                ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                : droneCorridorAnalysis.summary.status === 'CAUTION'
+                                  ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                  : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            }`}
+                          >
+                            {droneCorridorAnalysis.summary.status} ·{' '}
+                            {droneCorridorAnalysis.summary.minClearanceMeters > 0
+                              ? `+${droneCorridorAnalysis.summary.minClearanceMeters}`
+                              : droneCorridorAnalysis.summary.minClearanceMeters}
+                            m
+                          </span>
+                        </div>
+                        {droneConfig.autoClimbCorridor && (
+                          <div className="flex justify-between text-[10px] text-emerald-700">
+                            <span>Safe Climb Peak</span>
+                            <span className="font-semibold">
+                              {droneCorridorAnalysis.summary.maxSafeFlightMeters}m MSL
+                            </span>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

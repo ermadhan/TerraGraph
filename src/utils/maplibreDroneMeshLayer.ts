@@ -302,6 +302,11 @@ void main() {
     const envVerts = new Float32Array(vertCount * floatsPerVert);
     const ceilVerts = new Float32Array(vertCount * floatsPerVert);
 
+    let envElevMin = Infinity;
+    let envElevMax = -Infinity;
+    let ceilElevMin = Infinity;
+    let ceilElevMax = -Infinity;
+
     for (let r = 0; r < rows; r++) {
       const v = rows > 1 ? r / (rows - 1) : 0.5;
       const lat = maxLat - v * (maxLat - minLat);
@@ -318,6 +323,11 @@ void main() {
         // +3.0m visual lift prevents coarse terrain mesh ridges from Z-occluding the envelope sheet
         const envRenderElev = tElev * this.exaggeration + (envelopeElev[idx] - tElev) + 3.0;
         const ceilRenderElev = tElev * this.exaggeration + (ceilingElev[idx] - tElev) + 4.0;
+
+        if (envRenderElev < envElevMin) envElevMin = envRenderElev;
+        if (envRenderElev > envElevMax) envElevMax = envRenderElev;
+        if (ceilRenderElev < ceilElevMin) ceilElevMin = ceilRenderElev;
+        if (ceilRenderElev > ceilElevMax) ceilElevMax = ceilRenderElev;
 
         let er = 0.05;
         let eg = 0.58;
@@ -363,6 +373,53 @@ void main() {
         ceilVerts[base + 3] = cr;
         ceilVerts[base + 4] = cg;
         ceilVerts[base + 5] = cb;
+      }
+    }
+
+    // Clamp envelope vertices cleanly above exaggerated Overture building roofs across sloped terrain
+    const hBuf = Math.max(0, config.horizontalBufferMeters);
+    const vBuf = Math.max(0, config.verticalBufferMeters);
+    const cosLat = Math.max(0.15, Math.cos((cLat * Math.PI) / 180));
+    const metersPerDegLat = 111319.9;
+    const metersPerDegLon = 111319.9 * cosLat;
+    const lonSpan = Math.max(1e-9, maxLon - minLon);
+    const latSpan = Math.max(1e-9, maxLat - minLat);
+    const cellM = Math.max(grid.widthMeters / Math.max(1, cols - 1), grid.depthMeters / Math.max(1, rows - 1));
+    const padLon = (hBuf + cellM) / metersPerDegLon;
+    const padLat = (hBuf + cellM) / metersPerDegLat;
+
+    for (const b of buildings) {
+      if (b.ring.length < 3) continue;
+      let bMinLon = Infinity;
+      let bMaxLon = -Infinity;
+      let bMinLat = Infinity;
+      let bMaxLat = -Infinity;
+      let bTerrainMax = -Infinity;
+
+      for (const [lon, lat] of b.ring) {
+        if (lon < bMinLon) bMinLon = lon;
+        if (lon > bMaxLon) bMaxLon = lon;
+        if (lat < bMinLat) bMinLat = lat;
+        if (lat > bMaxLat) bMaxLat = lat;
+        const t = sampleTerrainBilinear(grid, lon, lat);
+        if (t > bTerrainMax) bTerrainMax = t;
+      }
+      if (!Number.isFinite(bTerrainMax)) continue;
+
+      const minReqEnvElev = bTerrainMax * this.exaggeration + b.heightMeters + vBuf + 3.5;
+      const c0 = Math.max(0, Math.floor(((bMinLon - padLon - minLon) / lonSpan) * (cols - 1)));
+      const c1 = Math.min(cols - 1, Math.ceil(((bMaxLon + padLon - minLon) / lonSpan) * (cols - 1)));
+      const r0 = Math.max(0, Math.floor(((maxLat - (bMaxLat + padLat)) / latSpan) * (rows - 1)));
+      const r1 = Math.min(rows - 1, Math.ceil(((maxLat - (bMinLat - padLat)) / latSpan) * (rows - 1)));
+
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const base = (r * cols + c) * floatsPerVert;
+          if (envVerts[base + 2] < minReqEnvElev) {
+            envVerts[base + 2] = minReqEnvElev;
+            if (minReqEnvElev > envElevMax) envElevMax = minReqEnvElev;
+          }
+        }
       }
     }
 
@@ -420,12 +477,7 @@ void main() {
     const bVerts: number[] = [];
     const bTriIdx: number[] = [];
     const bLineIdx: number[] = [];
-    const cosLat = Math.max(0.15, Math.cos((cLat * Math.PI) / 180));
-    const metersPerDegLat = 111319.9;
-    const metersPerDegLon = 111319.9 * cosLat;
-    const hBuf = Math.max(0, config.horizontalBufferMeters);
-    const vBuf = Math.max(0, config.verticalBufferMeters);
-    const maxMapPrisms = Math.min(buildings.length, 220);
+    const maxMapPrisms = Math.min(buildings.length, 280);
 
     for (let bIdx = 0; bIdx < maxMapPrisms; bIdx++) {
       const b = buildings[bIdx];
@@ -553,7 +605,7 @@ void main() {
     }
     uploadBatch(gl, this.curtainFill, new Float32Array(curVerts), new Uint32Array(curTris));
 
-    // Build 3D Elevated Drone Flight Corridor Path + Vertical Waypoint Pylons
+    // Build 3D Elevated Drone Flight Corridor Path + Obstacle-Aware Climb Path + Waypoint Pylons
     const corrVerts: number[] = [];
     const corrLines: number[] = [];
     if (this.corridorAnalysis && this.corridorAnalysis.samples.length >= 2) {
@@ -571,18 +623,72 @@ void main() {
         corrVerts.push(merc.x, merc.y, zElev, r, g, b);
         if (i > 0) corrLines.push(i - 1, i);
       }
+
+      if (config.autoClimbCorridor) {
+        const safeStart = corrVerts.length / 6;
+        for (let i = 0; i < samples.length; i++) {
+          const s = samples[i];
+          const merc = maplibregl.MercatorCoordinate.fromLngLat([s.lon, s.lat], 0);
+          const zSafe =
+            s.terrainMeters * this.exaggeration + (s.safeFlightMeters - s.terrainMeters) + 6.5;
+          corrVerts.push(merc.x, merc.y, zSafe, 0.02, 0.78, 0.55);
+          if (i > 0) corrLines.push(safeStart + i - 1, safeStart + i);
+        }
+      }
+
       for (const [wLon, wLat] of this.corridorAnalysis.waypoints) {
         const gElev = sampleTerrainBilinear(grid, wLon, wLat);
+        const envElev =
+          gElev +
+          (grid.buildings.length > 0
+            ? Math.max(0, config.verticalBufferMeters)
+            : config.verticalBufferMeters);
         const cElev =
           config.altitudeMode === 'agl' ? gElev + config.ceilingMeters : config.ceilingMeters;
+        const topElev = config.autoClimbCorridor ? Math.max(cElev, envElev + 5) : cElev;
         const merc = maplibregl.MercatorCoordinate.fromLngLat([wLon, wLat], 0);
         const idx = corrVerts.length / 6;
         corrVerts.push(merc.x, merc.y, gElev * this.exaggeration, 0.06, 0.09, 0.16);
-        corrVerts.push(merc.x, merc.y, gElev * this.exaggeration + (cElev - gElev) + 5.0, 0.06, 0.09, 0.16);
+        corrVerts.push(
+          merc.x,
+          merc.y,
+          gElev * this.exaggeration + (topElev - gElev) + 6.5,
+          0.06,
+          0.09,
+          0.16,
+        );
         corrLines.push(idx, idx + 1);
       }
     }
     uploadBatch(gl, this.corridorWire, new Float32Array(corrVerts), new Uint32Array(corrLines));
+
+    // Debug logging once per buffer rebuild to verify MapLibre projection origin & grid elevations
+    const originMerc = maplibregl.MercatorCoordinate.fromLngLat([cLon, cLat], 0);
+    const centerIdx = Math.floor(rows / 2) * cols + Math.floor(cols / 2);
+    const readSample = (idx: number) => {
+      const b = idx * floatsPerVert;
+      return {
+        mercX: Number(envVerts[b].toFixed(6)),
+        mercY: Number(envVerts[b + 1].toFixed(6)),
+        envElevM: Number(envVerts[b + 2].toFixed(1)),
+        ceilElevM: Number(ceilVerts[b + 2].toFixed(1)),
+      };
+    };
+
+    console.info('[MapLibreDroneMeshLayer] Grid buffer vertices', {
+      originLngLat: [Number(cLon.toFixed(5)), Number(cLat.toFixed(5))],
+      originMercator: [Number(originMerc.x.toFixed(6)), Number(originMerc.y.toFixed(6))],
+      exaggeration: this.exaggeration,
+      gridVertexCount: vertCount,
+      buildingPrismsRendered: Math.min(buildings.length, maxMapPrisms),
+      envElevRenderRange: [Number(envElevMin.toFixed(1)), Number(envElevMax.toFixed(1))],
+      ceilElevRenderRange: [Number(ceilElevMin.toFixed(1)), Number(ceilElevMax.toFixed(1))],
+      sampleVertices: {
+        nw: readSample(0),
+        center: readSample(centerIdx),
+        se: readSample(vertCount - 1),
+      },
+    });
   }
 
   render(gl: WebGL2RenderingContext, options: maplibregl.CustomRenderMethodInput): void {

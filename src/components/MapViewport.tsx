@@ -1033,72 +1033,120 @@ export const MapViewport: React.FC<MapViewportProps> = ({
         ];
         const zoom = map.getZoom();
 
+        // Expanded AOI bounding filter around focal center to avoid horizon bloat while catching buffered edges
+        const filterMinLon = center[0] - 0.022;
+        const filterMaxLon = center[0] + 0.022;
+        const filterMinLat = center[1] - 0.018;
+        const filterMaxLat = center[1] + 0.018;
+
         const queryLayers = ['overture-buildings-3d', 'overture-building-parts-3d'].filter((id) =>
           Boolean(map.getLayer(id)),
         );
+        const rawFeatures: maplibregl.GeoJSONFeature[] = [];
+
+        if (map.getSource('overture-buildings')) {
+          try {
+            rawFeatures.push(
+              ...(map.querySourceFeatures('overture-buildings', {
+                sourceLayer: 'building',
+              }) as unknown as maplibregl.GeoJSONFeature[]),
+            );
+            rawFeatures.push(
+              ...(map.querySourceFeatures('overture-buildings', {
+                sourceLayer: 'building_part',
+              }) as unknown as maplibregl.GeoJSONFeature[]),
+            );
+          } catch {
+            // Fallback to rendered features if vector tile query fails mid-transition
+          }
+        }
+        if (queryLayers.length > 0) {
+          rawFeatures.push(...map.queryRenderedFeatures({ layers: queryLayers }));
+        }
+
+        const parseNum = (val: unknown): number | null => {
+          if (typeof val === 'number' && Number.isFinite(val)) return val;
+          if (typeof val === 'string' && val.trim() !== '') {
+            const parsed = Number(val);
+            if (Number.isFinite(parsed)) return parsed;
+          }
+          return null;
+        };
+
         const buildings: DroneBuildingFootprint[] = [];
         const seen = new Set<string>();
 
-        if (queryLayers.length > 0) {
-          const features = map.queryRenderedFeatures({ layers: queryLayers });
-          for (const f of features) {
-            const props = (f.properties || {}) as Record<string, unknown>;
-            const rawHeight =
-              typeof props.height === 'number'
-                ? props.height
-                : typeof props.num_floors === 'number'
-                  ? props.num_floors * 3.5
-                  : 7;
-            const heightMeters = Math.max(2, Number.isFinite(rawHeight) ? rawHeight : 7);
-            const minHeightMeters =
-              typeof props.min_height === 'number' && Number.isFinite(props.min_height)
-                ? props.min_height
-                : 0;
+        for (const f of rawFeatures) {
+          const props = (f.properties || {}) as Record<string, unknown>;
+          const hNum = parseNum(props.height);
+          const floorsNum = parseNum(props.num_floors);
+          const rawHeight = hNum !== null ? hNum : floorsNum !== null ? floorsNum * 3.5 : 7;
+          const heightMeters = Math.max(2, rawHeight);
+          const minHNum = parseNum(props.min_height);
+          const minHeightMeters = minHNum !== null && minHNum >= 0 ? minHNum : 0;
 
-            const geom = f.geometry;
-            const extractRing = (ringCoords: unknown): Array<[number, number]> => {
-              if (!Array.isArray(ringCoords)) return [];
-              const pts: Array<[number, number]> = [];
-              for (const pt of ringCoords) {
-                if (Array.isArray(pt) && pt.length >= 2) {
-                  const lon = Number(pt[0]);
-                  const lat = Number(pt[1]);
-                  if (Number.isFinite(lon) && Number.isFinite(lat)) {
-                    pts.push([lon, lat]);
-                  }
-                }
-              }
-              return pts;
-            };
+          const geom = f.geometry;
+          if (!geom) continue;
 
-            const polygons: Array<Array<[number, number]>> = [];
-            if (geom.type === 'Polygon' && Array.isArray(geom.coordinates[0])) {
-              polygons.push(extractRing(geom.coordinates[0]));
-            } else if (geom.type === 'MultiPolygon') {
-              for (const poly of geom.coordinates) {
-                if (Array.isArray(poly[0])) {
-                  polygons.push(extractRing(poly[0]));
+          const extractRing = (ringCoords: unknown): Array<[number, number]> => {
+            if (!Array.isArray(ringCoords)) return [];
+            const pts: Array<[number, number]> = [];
+            for (const pt of ringCoords) {
+              if (Array.isArray(pt) && pt.length >= 2) {
+                const lon = Number(pt[0]);
+                const lat = Number(pt[1]);
+                if (Number.isFinite(lon) && Number.isFinite(lat)) {
+                  pts.push([lon, lat]);
                 }
               }
             }
+            return pts;
+          };
 
-            polygons.forEach((ring, polyIdx) => {
-              if (ring.length < 3) return;
-              const cLon = ring[0][0].toFixed(5);
-              const cLat = ring[0][1].toFixed(5);
-              const dedupKey = `${String(props.id || f.id || '')}-${cLon}-${cLat}-${polyIdx}`;
-              if (seen.has(dedupKey)) return;
-              seen.add(dedupKey);
-              buildings.push({
-                id: dedupKey,
-                title: extractFeatureTitle(props, 'Overture Building'),
-                heightMeters,
-                minHeightMeters,
-                ring,
-              });
-            });
+          const polygons: Array<Array<[number, number]>> = [];
+          if (geom.type === 'Polygon' && Array.isArray(geom.coordinates[0])) {
+            polygons.push(extractRing(geom.coordinates[0]));
+          } else if (geom.type === 'MultiPolygon') {
+            for (const poly of geom.coordinates) {
+              if (Array.isArray(poly[0])) {
+                polygons.push(extractRing(poly[0]));
+              }
+            }
           }
+
+          polygons.forEach((ring, polyIdx) => {
+            if (ring.length < 3) return;
+            let inAoi = false;
+            for (const [lon, lat] of ring) {
+              if (
+                lon >= filterMinLon &&
+                lon <= filterMaxLon &&
+                lat >= filterMinLat &&
+                lat <= filterMaxLat
+              ) {
+                inAoi = true;
+                break;
+              }
+            }
+            if (!inAoi) return;
+
+            const cLon = ring[0][0].toFixed(5);
+            const cLat = ring[0][1].toFixed(5);
+            const dedupKey = `${String(props.id || f.id || '')}-${cLon}-${cLat}-${polyIdx}`;
+            if (seen.has(dedupKey)) return;
+            seen.add(dedupKey);
+            buildings.push({
+              id: dedupKey,
+              title: extractFeatureTitle(props, 'Overture Building'),
+              heightMeters,
+              minHeightMeters,
+              ring,
+            });
+          });
         }
+
+        // Prioritize tallest structures first so render caps never drop skyline towers
+        buildings.sort((a, b) => b.heightMeters - a.heightMeters);
 
         return { center, bbox, zoom, buildings };
       },
